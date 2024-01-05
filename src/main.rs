@@ -17,10 +17,9 @@ type DroneMap = HashMap<usize, Box<dyn Drone>>;
 fn main() {
     // Initialize 5 quadcopters
     let mut drones = (0..5)
-        .into_iter()
         .map(|x| {
             (
-                x as usize,
+                x,
                 Box::new(QuadCopter::new(x, (0.0, 0.0))) as Box<dyn Drone>,
             )
         })
@@ -44,12 +43,12 @@ fn main() {
 }
 
 fn run_state_machine(drones: &mut DroneMap) {
-    while true {
+    loop {
         drones.iter_mut().for_each(|(x, v)| {
             v.state_update(Instant::now());
             v.action();
             println!("drone {:?}: {:?}", x, v.broadcast_state());
         });
-        thread::sleep(Duration::from_secs(2));
+        thread::sleep(Duration::from_micros(100));
     }
 }
