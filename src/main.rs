@@ -13,7 +13,6 @@ use utils::{Objective, ObjectiveType};
 
 type DroneMap = HashMap<usize, Box<dyn Drone>>;
 
-
 fn main() {
     // Initialize 5 quadcopters
     let mut drones = (0..5)
@@ -26,7 +25,7 @@ fn main() {
         .collect::<DroneMap>();
 
     // Assign waypoint route to drone 0
-    let custom_waypoints = vec![(1.0, 1.0), (50.0, 200.0), (3000.0, 400.0)];
+    let custom_waypoints = vec![(100.0, 25.0), (50.0, 200.0), (300.0, 400.0)];
     let new_objective = Some(Box::new(Objective {
         task: ObjectiveType::ReachWaypoint,
         waypoints: Some(custom_waypoints),

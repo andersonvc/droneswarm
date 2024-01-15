@@ -1,5 +1,5 @@
 use crate::utils::{Objective, State};
-use std::time::{Instant};
+use std::time::Instant;
 
 pub trait Drone {
     fn state_update(&mut self, timestamp: Instant);
