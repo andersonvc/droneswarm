@@ -1,0 +1,2 @@
+#!/bin/bash
+cargo build --manifest-path=drone-lib/Cargo.toml && wasm-pack build --target web wasm-lib && npm --prefix webapp install && npm --prefix ./webapp run dev -- --open
