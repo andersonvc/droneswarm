@@ -12,3 +12,5 @@ crate-type = ["cdylib", "rlib"]
 js-sys = "0.3.67"
 wasm-bindgen = "0.2.90"
 drone-lib = { path = "../drone-lib" }
+serde-wasm-bindgen = "0.6.3"
+serde = "1.0.195"
