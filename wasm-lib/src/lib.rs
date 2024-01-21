@@ -9,16 +9,20 @@ pub fn hello() -> Number {
     Number::from(42)
 }
 
-#[derive(Serialize)]
+#[wasm_bindgen(getter_with_clone)]
+#[derive(Serialize,Clone)]
 pub struct DronePos {
     pub id: u32,
     pub x: f32,
     pub y: f32,
 }
 
+#[wasm_bindgen(getter_with_clone)]
 #[derive(Serialize)]
 pub struct MyDummy {
-    pub drones: Vec<DronePos>,
+    //pub drones: Vec<DronePos>,
+    //pub drone: DronePos,
+    pub val: u32,
 }
 
 
@@ -30,16 +34,23 @@ impl MyDummy {
             DronePos{id:2, x:500.0, y:400.0},
             DronePos{id:3, x:800.0, y:100.0},
         ];
+        //MyDummy {
+        //    drones: drone_poses,
+        //}
         MyDummy {
-            drones: drone_poses,
+            //drone: drone_poses[0].clone(),
+            val:55,
         }
     }
 }
 
 #[wasm_bindgen]
-pub fn plot() -> JsValue {
+pub fn plot() -> MyDummy {
     let mut my_dummy = MyDummy::new();
-    serde_wasm_bindgen::to_value(&my_dummy).unwrap()
+    let mynum:u32 = 1;
+    my_dummy
+    //serde_wasm_bindgen::to_value(&my_dummy).unwrap()
+    //serde_wasm_bindgen::to_value(&my_dummy.drone).unwrap()
 }
 
 
