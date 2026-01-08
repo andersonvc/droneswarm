@@ -36,12 +36,12 @@ pub struct VelocityObstacleConfig {
 impl Default for VelocityObstacleConfig {
     fn default() -> Self {
         VelocityObstacleConfig {
-            lookahead_time: 1.0,
-            num_samples: 15,
-            time_samples: 5,
-            safe_distance: 50.0,
-            avoidance_weight: 0.85,
-            detection_range: 120.0,
+            lookahead_time: 2.5,       // Increased: more time to react
+            num_samples: 25,            // Heading samples to evaluate
+            time_samples: 10,           // Trajectory samples along path
+            safe_distance: 90.0,        // 3x collision diameter (30)
+            avoidance_weight: 0.9,      // Prioritize avoidance
+            detection_range: 250.0,     // Early awareness range
         }
     }
 }
@@ -133,7 +133,7 @@ pub fn calculate_velocity_obstacle(
             if d.uid == self_id {
                 return false;
             }
-            let dist = bounds.toroidal_distance(
+            let dist = bounds.distance(
                 self_state.pos.as_vec2(),
                 d.pos.as_vec2(),
             );
@@ -190,7 +190,7 @@ pub fn calculate_velocity_obstacle(
                     bounds,
                 );
 
-                let separation = bounds.toroidal_distance(
+                let separation = bounds.distance(
                     predicted_self.as_vec2(),
                     predicted_neighbor.as_vec2(),
                 );
@@ -198,7 +198,7 @@ pub fn calculate_velocity_obstacle(
                 if separation < min_separation {
                     min_separation = separation;
                     // Determine if this neighbor is on our right or left
-                    let to_neighbor = bounds.toroidal_delta(
+                    let to_neighbor = bounds.delta(
                         self_state.pos.as_vec2(),
                         neighbor.pos.as_vec2(),
                     );
@@ -236,31 +236,22 @@ pub fn calculate_velocity_obstacle(
         let mut score = goal_score * (1.0 - config.avoidance_weight)
             + separation_score * config.avoidance_weight;
 
-        // TURN AWAY FROM THREAT: Prefer turning away from the closest threat
-        // If threat is on right, turn left (positive offset); if on left, turn right (negative)
-        // This ensures drones pass each other safely.
-        if min_separation < config.safe_distance * 1.5 {
-            let threat_proximity = 1.0 - (min_separation / (config.safe_distance * 1.5));
-            let turn_away_bias = if closest_threat_on_right {
-                // Threat on right -> prefer turning left (positive heading offset)
-                if heading_offset > 0.0 {
-                    0.15 * threat_proximity
-                } else if heading_offset < 0.0 {
-                    -0.15 * threat_proximity
-                } else {
-                    0.0
-                }
+        // CONSISTENT TURN DIRECTION: Use deterministic rules to avoid "reciprocal dance"
+        // Rule: ALWAYS turn RIGHT (negative heading offset) when threatened
+        // This is similar to ICAO flight rules where aircraft turn right on head-on approach
+        // Both drones turning right means they pass each other safely (left-to-left)
+        if min_separation < config.safe_distance * 2.0 {
+            let threat_proximity = 1.0 - (min_separation / (config.safe_distance * 2.0));
+            let turn_right_bias = if heading_offset < 0.0 {
+                // Turning right - strongly prefer this
+                0.3 * threat_proximity
+            } else if heading_offset > 0.0 {
+                // Turning left - penalize this
+                -0.2 * threat_proximity
             } else {
-                // Threat on left -> prefer turning right (negative heading offset)
-                if heading_offset < 0.0 {
-                    0.15 * threat_proximity
-                } else if heading_offset > 0.0 {
-                    -0.15 * threat_proximity
-                } else {
-                    0.0
-                }
+                0.0
             };
-            score += turn_away_bias;
+            score += turn_right_bias;
         }
 
         if score > best_score {
@@ -297,12 +288,10 @@ fn predict_position(
     let dx = heading.radians().cos() * distance;
     let dy = heading.radians().sin() * distance;
 
-    let new_pos = Position::new(
+    Position::new(
         start.x() + dx,
         start.y() + dy,
-    );
-
-    bounds.wrap_position(new_pos)
+    )
 }
 
 /// Convenience function to get recommended heading directly.

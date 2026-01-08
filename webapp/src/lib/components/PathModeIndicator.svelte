@@ -10,6 +10,10 @@
             ? 'Click to add nodes | Right-click to assign looping route to ALL | Escape to cancel'
             : 'Click to add | Right-click to confirm | Escape to cancel'
     );
+
+    function handleClearRoute() {
+        currentPath.set([]);
+    }
 </script>
 
 {#if $pathMode}
@@ -17,6 +21,11 @@
         <span class="badge">{modeLabel}</span>
         <span class="waypoints">Waypoints: <span class="count">{$currentPath.length}</span></span>
         <span class="hint">{hint}</span>
+        {#if $objectiveMode === 'route'}
+            <button class="clear-btn" onclick={handleClearRoute}>
+                Clear Route
+            </button>
+        {/if}
     </div>
 {/if}
 
@@ -64,5 +73,23 @@
     .hint {
         color: #6b7280;
         font-size: 12px;
+    }
+
+    .clear-btn {
+        background: #1a1a1f;
+        border: 1px solid #2a2a30;
+        color: #9ca3af;
+        padding: 6px 12px;
+        border-radius: 4px;
+        font-size: 12px;
+        font-family: 'DM Sans', system-ui, sans-serif;
+        cursor: pointer;
+        transition: all 0.15s ease;
+    }
+
+    .clear-btn:hover {
+        background: #252530;
+        color: #fff;
+        border-color: #9DFF20;
     }
 </style>

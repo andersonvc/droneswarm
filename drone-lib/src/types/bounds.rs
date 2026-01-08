@@ -67,6 +67,33 @@ impl Bounds {
         let dy = wrap_delta(to.y - from.y, self.height);
         Vec2::new(dx, dy)
     }
+
+    /// Calculate simple (non-toroidal) distance between two points
+    #[inline]
+    pub fn distance(&self, from: Vec2, to: Vec2) -> f32 {
+        self.delta(from, to).magnitude()
+    }
+
+    /// Calculate simple delta vector between two points (no wrapping)
+    #[inline]
+    pub fn delta(&self, from: Vec2, to: Vec2) -> Vec2 {
+        Vec2::new(to.x - from.x, to.y - from.y)
+    }
+
+    /// Check if a position is within bounds
+    #[inline]
+    pub fn contains(&self, pos: Vec2) -> bool {
+        pos.x >= 0.0 && pos.x < self.width && pos.y >= 0.0 && pos.y < self.height
+    }
+
+    /// Clamp a position to stay within bounds
+    #[inline]
+    pub fn clamp_position(&self, pos: Position) -> Position {
+        Position::new(
+            pos.x().clamp(0.0, self.width - 0.01),
+            pos.y().clamp(0.0, self.height - 0.01),
+        )
+    }
 }
 
 /// Wrap a delta value to the range [-size/2, size/2) using branch-free arithmetic

@@ -35,6 +35,7 @@
     const DRONE_WIDTH = 10;
     const SELECTION_RADIUS = 20;
     const WAYPOINT_RADIUS = 8;
+    const COLLISION_RADIUS = 15; // Half of COLLISION_DISTANCE (30) from wasm-lib
 
     // Shield AI color palette
     const LIME_ACCENT = '#9DFF20';
@@ -77,6 +78,13 @@
             drawPathWaypoints();
         }
 
+        // Draw spline paths for drones in route mode
+        for (const drone of $renderState) {
+            if (drone.splinePath && drone.splinePath.length > 1) {
+                drawSplinePath(drone.splinePath);
+            }
+        }
+
         // Draw drones
         for (const drone of $renderState) {
             drawDrone(drone);
@@ -106,6 +114,24 @@
             ctx.lineTo(width, y);
             ctx.stroke();
         }
+    }
+
+    function drawSplinePath(points: { x: number; y: number }[]) {
+        if (!ctx || points.length < 2) return;
+
+        ctx.strokeStyle = 'rgba(255, 0, 0, 0.7)'; // 70% translucent red
+        ctx.lineWidth = 2;
+        ctx.setLineDash([8, 4]); // Dashed line
+
+        ctx.beginPath();
+        ctx.moveTo(points[0].x, points[0].y);
+
+        for (let i = 1; i < points.length; i++) {
+            ctx.lineTo(points[i].x, points[i].y);
+        }
+
+        ctx.stroke();
+        ctx.setLineDash([]); // Reset dash
     }
 
     function drawWaypointMarkers() {
@@ -229,6 +255,15 @@
 
         const backRightX = x - cosH * (DRONE_HEIGHT / 2) + sinH * (DRONE_WIDTH / 2);
         const backRightY = y - sinH * (DRONE_HEIGHT / 2) - cosH * (DRONE_WIDTH / 2);
+
+        // Draw collision boundary (dashed circle, white 10% opacity)
+        ctx.strokeStyle = 'rgba(255, 255, 255, 0.4)';
+        ctx.lineWidth = 1;
+        ctx.setLineDash([4, 4]);
+        ctx.beginPath();
+        ctx.arc(x, y, COLLISION_RADIUS, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.setLineDash([]);
 
         if (selected) {
             // Lime green selection ring with glow

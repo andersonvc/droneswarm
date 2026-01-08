@@ -106,8 +106,8 @@ impl FixedWing {
             &self.velocity_obstacle,
         );
 
-        // Apply the heading adjustment from VO
-        let target_heading = Heading::new(self.state.hdg.radians() + vo_result.heading_adjustment);
+        // Apply the heading adjustment from VO to the desired heading
+        let target_heading = Heading::new(desired_heading.radians() + vo_result.heading_adjustment);
 
         // Calculate heading error (shortest angular distance)
         let hdg_error = self.state.hdg.difference(target_heading);
@@ -119,9 +119,11 @@ impl FixedWing {
         let turn = hdg_error.clamp(-max_turn, max_turn);
         self.state.hdg += turn;
 
-        // Speed control - go slower if urgent avoidance needed
-        let speed_factor = if vo_result.urgency > 0.5 {
-            1.0 - (vo_result.urgency - 0.5) * 0.5 // Slow down by up to 25% at max urgency
+        // Speed control - more aggressive slowdown when collision is imminent
+        // At urgency 0.3+, start slowing; at urgency 1.0, reduce to 40% speed
+        let speed_factor = if vo_result.urgency > 0.3 {
+            let urgency_above_threshold = (vo_result.urgency - 0.3) / 0.7; // 0 to 1
+            1.0 - urgency_above_threshold * 0.6 // Slow down to 40% at max urgency
         } else {
             1.0
         };
@@ -136,9 +138,8 @@ impl FixedWing {
         self.state.vel = Velocity::from_heading_and_speed(self.state.hdg, new_speed);
         self.state.acc = Acceleration::from_heading_and_magnitude(self.state.hdg, accel);
 
-        // Update position with wrapping
+        // Update position (unbounded - can move beyond screen)
         self.state.pos += self.state.vel.scaled(dt);
-        self.state.pos = self.bounds.wrap_position(self.state.pos);
     }
 
     /// Move toward a target delta while incorporating avoidance steering.
@@ -239,9 +240,8 @@ impl FixedWing {
         // Store acceleration for debugging/display (along heading)
         self.state.acc = Acceleration::from_heading_and_magnitude(self.state.hdg, accel);
 
-        // Update position: pos += vel * dt, then wrap to bounds
+        // Update position: pos += vel * dt (unbounded)
         self.state.pos += self.state.vel.scaled(dt);
-        self.state.pos = self.bounds.wrap_position(self.state.pos);
     }
 
     /// Get immutable reference to drone objective
@@ -255,28 +255,269 @@ impl FixedWing {
     /// # Arguments
     /// * `dt` - Delta time in seconds
     /// * `swarm` - All drones for velocity obstacle calculations
-    fn process_waypoints(&mut self, dt: f32, swarm: &[DroneInfo]) -> bool {
-        if let Some(&waypoint) = self.objective.waypoints.front() {
+    /// * `use_smoothing` - If true, uses smoothed 3-waypoint lookahead (for route mode)
+    fn process_waypoints(&mut self, dt: f32, swarm: &[DroneInfo], use_smoothing: bool) -> bool {
+        // Pop all waypoints that are within clearance (handles fast movement / close waypoints)
+        while let Some(&waypoint) = self.objective.waypoints.front() {
             let delta = self
                 .bounds
-                .toroidal_delta(self.state.pos.as_vec2(), waypoint.as_vec2());
+                .delta(self.state.pos.as_vec2(), waypoint.as_vec2());
             let dist_to_waypt = delta.magnitude();
 
             if dist_to_waypt < self.waypoint_clearance {
                 self.objective.waypoints.pop_front();
-            }
-
-            if let Some(&next_waypoint) = self.objective.waypoints.front() {
-                let next_delta = self
-                    .bounds
-                    .toroidal_delta(self.state.pos.as_vec2(), next_waypoint.as_vec2());
-                // Compute desired heading toward waypoint
-                let desired_heading = Heading::new(next_delta.heading());
-                self.move_to_heading(desired_heading, swarm, dt);
-                return true;
+            } else {
+                break; // Next waypoint is not yet reached
             }
         }
-        false
+
+        if self.objective.waypoints.is_empty() {
+            return false;
+        }
+
+        // Compute heading - smoothed for routes, direct for waypoints
+        let desired_heading = if use_smoothing {
+            self.compute_smoothed_heading()
+        } else {
+            // Direct heading to next waypoint
+            let next_waypoint = self.objective.waypoints.front().unwrap();
+            let next_delta = self
+                .bounds
+                .delta(self.state.pos.as_vec2(), next_waypoint.as_vec2());
+            Heading::new(next_delta.heading())
+        };
+        self.move_to_heading(desired_heading, swarm, dt);
+        true
+    }
+
+    /// Compute a smoothed heading using Stanley controller on a Hermite spline.
+    ///
+    /// Stanley controller: steering = heading_error + atan(k * cross_track_error / speed)
+    /// - heading_error: angle between drone heading and path tangent
+    /// - cross_track_error: signed perpendicular distance from drone to path
+    fn compute_smoothed_heading(&self) -> Heading {
+        let drone_pos = self.state.pos.as_vec2();
+        let mut waypoints: Vec<Position> = self.objective.waypoints.iter().take(2).copied().collect();
+
+        if waypoints.is_empty() {
+            return self.state.hdg;
+        }
+
+        // Get WP1 position
+        let wp1 = waypoints[0].as_vec2();
+        let to_wp1 = self.bounds.delta(drone_pos, wp1);
+        let dist_to_wp1 = to_wp1.magnitude();
+
+        if dist_to_wp1 < f32::EPSILON {
+            return self.state.hdg;
+        }
+
+        // If only one waypoint but we have a route, use route[0] as second waypoint for spline
+        if waypoints.len() == 1 {
+            if let Some(route) = &self.objective.route {
+                if !route.is_empty() {
+                    waypoints.push(route[0]);
+                }
+            }
+        }
+
+        // If still only one waypoint, head straight to it
+        if waypoints.len() == 1 {
+            return Heading::new(to_wp1.heading());
+        }
+
+        // Build Hermite spline (relative to drone at origin)
+        let waypoint_refs: Vec<&Position> = waypoints.iter().collect();
+        let (p0, p1, t0, t1) = self.build_spline_params(&waypoint_refs);
+
+        let speed = self.state.vel.speed();
+
+        // Speed-adaptive lookahead: faster drones look further ahead
+        // This gives more time to turn, preventing overshoot on curves
+        const BASE_LOOKAHEAD: f32 = 30.0;
+        const SPEED_LOOKAHEAD_FACTOR: f32 = 1.5; // seconds of travel time
+        let lookahead_dist = BASE_LOOKAHEAD + speed * SPEED_LOOKAHEAD_FACTOR;
+        let lookahead_t = (lookahead_dist / dist_to_wp1).clamp(0.05, 0.8);
+
+        // Get the lookahead point and tangent
+        let lookahead_point = Self::hermite_point(p0, p1, t0, t1, lookahead_t);
+        let path_tangent = Self::hermite_tangent(p0, p1, t0, t1, lookahead_t);
+
+        // Check how much we need to turn to face the lookahead point
+        let pursuit_heading = Heading::new(lookahead_point.heading());
+        let heading_to_target = self.state.hdg.difference(pursuit_heading);
+
+        // If the turn is very sharp (> 90 degrees), we may need to consider
+        // that we're overshooting. For now, just use the pursuit heading
+        // but could add logic to reduce speed or turn harder.
+
+        // Cross-track error for Stanley correction
+        let lookahead_to_drone = Vec2::new(-lookahead_point.x, -lookahead_point.y);
+        let path_tangent_norm = if path_tangent.magnitude() > f32::EPSILON {
+            path_tangent.normalized()
+        } else {
+            lookahead_point.normalized()
+        };
+        let cross_track = path_tangent_norm.perp().dot(lookahead_to_drone);
+
+        // Stanley correction (scaled down at high speed to prevent oscillation)
+        const STANLEY_K: f32 = 2.0;
+        const MIN_SPEED: f32 = 5.0;
+        let effective_speed = speed.max(MIN_SPEED);
+        let cross_track_correction = (STANLEY_K * cross_track / effective_speed).atan();
+
+        // Final heading: pursuit direction with cross-track correction
+        let desired_heading = pursuit_heading.radians() - cross_track_correction;
+
+        Heading::new(desired_heading)
+    }
+
+    /// Build Hermite spline parameters for the current route.
+    /// Returns (p0, p1, t0, t1) where the spline runs from the path start toward WP1.
+    fn build_spline_params(&self, waypoints: &[&Position]) -> (Vec2, Vec2, Vec2, Vec2) {
+        let drone_pos = self.state.pos.as_vec2();
+        let wp1 = waypoints[0].as_vec2();
+        let to_wp1 = self.bounds.delta(drone_pos, wp1);
+        let dist_to_wp1 = to_wp1.magnitude();
+
+        // P0: spline starts at drone's current position (origin in relative coords)
+        let p0 = Vec2::new(0.0, 0.0);
+        // P1: spline ends at WP1
+        let p1 = to_wp1;
+
+        // Tangent scale - use a fraction of distance, capped to reasonable value
+        let tangent_scale = (dist_to_wp1 * 0.5).min(150.0);
+
+        // T0: start tangent based on drone's velocity direction (or heading if not moving)
+        let speed = self.state.vel.speed();
+        let t0 = if speed > 1.0 {
+            self.state.vel.as_vec2().normalized() * tangent_scale
+        } else {
+            self.state.hdg.to_vec2() * tangent_scale
+        };
+
+        // T1: end tangent toward WP2
+        let wp1_to_wp2 = self.bounds.delta(wp1, waypoints[1].as_vec2());
+        let t1 = if wp1_to_wp2.magnitude() > f32::EPSILON {
+            wp1_to_wp2.normalized() * tangent_scale
+        } else {
+            to_wp1.normalized() * tangent_scale
+        };
+
+        (p0, p1, t0, t1)
+    }
+
+    /// Evaluate a point on a cubic Hermite spline at parameter t (0-1).
+    /// - p0: start position (at t=0)
+    /// - p1: end position (at t=1)
+    /// - t0: start tangent
+    /// - t1: end tangent
+    fn hermite_point(p0: Vec2, p1: Vec2, t0: Vec2, t1: Vec2, t: f32) -> Vec2 {
+        let t2 = t * t;
+        let t3 = t2 * t;
+
+        // Hermite basis functions
+        let h00 = 2.0 * t3 - 3.0 * t2 + 1.0; // p0 coefficient
+        let h10 = t3 - 2.0 * t2 + t;          // t0 coefficient
+        let h01 = -2.0 * t3 + 3.0 * t2;       // p1 coefficient
+        let h11 = t3 - t2;                     // t1 coefficient
+
+        Vec2::new(
+            h00 * p0.x + h10 * t0.x + h01 * p1.x + h11 * t1.x,
+            h00 * p0.y + h10 * t0.y + h01 * p1.y + h11 * t1.y,
+        )
+    }
+
+    /// Evaluate the tangent (derivative) of a cubic Hermite spline at parameter t (0-1).
+    fn hermite_tangent(p0: Vec2, p1: Vec2, t0: Vec2, t1: Vec2, t: f32) -> Vec2 {
+        let t2 = t * t;
+
+        // Derivatives of Hermite basis functions
+        let dh00 = 6.0 * t2 - 6.0 * t;        // d/dt(2t³ - 3t² + 1)
+        let dh10 = 3.0 * t2 - 4.0 * t + 1.0;  // d/dt(t³ - 2t² + t)
+        let dh01 = -6.0 * t2 + 6.0 * t;       // d/dt(-2t³ + 3t²)
+        let dh11 = 3.0 * t2 - 2.0 * t;        // d/dt(t³ - t²)
+
+        Vec2::new(
+            dh00 * p0.x + dh10 * t0.x + dh01 * p1.x + dh11 * t1.x,
+            dh00 * p0.y + dh10 * t0.y + dh01 * p1.y + dh11 * t1.y,
+        )
+    }
+
+    /// Get spline path points for visualization (only in route mode with 2+ waypoints).
+    /// Returns world coordinates for each point along the spline.
+    pub fn get_spline_path(&self, num_points: usize) -> Vec<Vec2> {
+        // Only compute spline for route mode
+        if !matches!(self.objective.task, ObjectiveType::FollowRoute) {
+            return Vec::new();
+        }
+
+        let drone_pos = self.state.pos.as_vec2();
+        let mut waypoints: Vec<Position> = self.objective.waypoints.iter().take(2).copied().collect();
+
+        if waypoints.is_empty() {
+            return Vec::new();
+        }
+
+        // If only one waypoint but we have a route, use route[0] as second waypoint for spline
+        if waypoints.len() == 1 {
+            if let Some(route) = &self.objective.route {
+                if !route.is_empty() {
+                    waypoints.push(route[0]);
+                }
+            }
+        }
+
+        if waypoints.len() < 2 {
+            return Vec::new();
+        }
+
+        let wp1 = waypoints[0].as_vec2();
+        let to_wp1 = self.bounds.delta(drone_pos, wp1);
+        let dist_to_wp1 = to_wp1.magnitude();
+
+        if dist_to_wp1 < f32::EPSILON {
+            return Vec::new();
+        }
+
+        // Hermite spline setup (relative to drone)
+        let p0 = Vec2::new(0.0, 0.0);
+        let p1 = to_wp1;
+
+        // Tangent scale - use a fraction of distance, capped to reasonable value
+        let tangent_scale = (dist_to_wp1 * 0.5).min(150.0);
+
+        // Start tangent: use drone's velocity direction (or heading if not moving)
+        let speed = self.state.vel.speed();
+        let t0 = if speed > 1.0 {
+            self.state.vel.as_vec2().normalized() * tangent_scale
+        } else {
+            self.state.hdg.to_vec2() * tangent_scale
+        };
+
+        // End tangent: direction toward WP2
+        let wp2 = waypoints[1].as_vec2();
+        let wp1_to_wp2 = self.bounds.delta(wp1, wp2);
+        let t1 = if wp1_to_wp2.magnitude() > f32::EPSILON {
+            wp1_to_wp2.normalized() * tangent_scale
+        } else {
+            to_wp1.normalized() * tangent_scale
+        };
+
+        // Generate points along the spline
+        let mut points = Vec::with_capacity(num_points);
+        for i in 0..num_points {
+            let t = i as f32 / (num_points - 1) as f32;
+            let relative_point = Self::hermite_point(p0, p1, t0, t1, t);
+            // Convert back to world coordinates
+            let world_point = Vec2::new(
+                drone_pos.x + relative_point.x,
+                drone_pos.y + relative_point.y,
+            );
+            points.push(world_point);
+        }
+
+        points
     }
 }
 
@@ -288,8 +529,8 @@ impl Drone for FixedWing {
     fn state_update(&mut self, dt: f32, swarm: &[DroneInfo]) {
         match self.objective.task {
             ObjectiveType::ReachWaypoint => {
-                // VO handles collision avoidance during waypoint following
-                if !self.process_waypoints(dt, swarm) && self.objective.waypoints.is_empty() {
+                // Direct waypoint navigation (no path smoothing)
+                if !self.process_waypoints(dt, swarm, false) && self.objective.waypoints.is_empty() {
                     self.objective.task = ObjectiveType::Sleep;
                 }
             }
@@ -300,8 +541,8 @@ impl Drone for FixedWing {
                         self.objective.waypoints = route.iter().copied().collect();
                     }
                 }
-                // VO handles collision avoidance during route following
-                self.process_waypoints(dt, swarm);
+                // Smoothed path planning with 3-waypoint lookahead for routes
+                self.process_waypoints(dt, swarm, true);
             }
             _ => {
                 // Sleep, Loiter, FollowTarget - use separation as fallback
@@ -381,35 +622,6 @@ mod tests {
         let params = DronePerfFeatures::new(100.0, 10.0, 2.0).unwrap();
         drone.set_flight_params(params);
         // Validation happens at DronePerfFeatures::new(), not set_flight_params
-    }
-
-    #[test]
-    fn test_waypoint_arrival_uses_toroidal_distance() {
-        // Drone at edge of world, waypoint just across the wrap boundary
-        let mut drone = FixedWing::new(
-            0,
-            Position::new(999.0, 500.0),
-            Heading::new(0.0),
-            create_test_bounds(),
-        );
-
-        // Set waypoint at x=1, which is only 2 units away toroidally
-        let mut waypoints = VecDeque::new();
-        waypoints.push_back(Position::new(1.0, 500.0));
-
-        drone.set_objective(Objective {
-            task: ObjectiveType::ReachWaypoint,
-            waypoints,
-            route: None,
-            targets: None,
-        });
-
-        // The waypoint should be detected as "arrived" since toroidal distance is 2 < default clearance (10)
-        drone.state_update(0.016, &[]);
-
-        // Waypoint should have been removed and task should be Sleep
-        assert!(drone.objective.waypoints.is_empty());
-        assert_eq!(drone.objective.task, ObjectiveType::Sleep);
     }
 
     #[test]
@@ -503,34 +715,4 @@ mod tests {
         assert!(vel.as_vec2().x.abs() > vel.as_vec2().y.abs());
     }
 
-    #[test]
-    fn test_position_wraps_automatically() {
-        let bounds = Bounds::new(100.0, 100.0).unwrap();
-        let mut drone = FixedWing::new(
-            0,
-            Position::new(99.0, 50.0),
-            Heading::new(0.0), // Facing right
-            bounds,
-        );
-
-        // Set waypoint far to the right (will cause position to exceed bounds)
-        let mut waypoints = VecDeque::new();
-        waypoints.push_back(Position::new(50.0, 50.0));
-
-        drone.set_objective(Objective {
-            task: ObjectiveType::ReachWaypoint,
-            waypoints,
-            route: None,
-            targets: None,
-        });
-
-        // Run updates until drone crosses the boundary
-        for _ in 0..100 {
-            drone.state_update(0.016, &[]);
-        }
-
-        // Position should be within bounds
-        assert!(drone.state().pos.x() >= 0.0 && drone.state().pos.x() < 100.0);
-        assert!(drone.state().pos.y() >= 0.0 && drone.state().pos.y() < 100.0);
-    }
 }

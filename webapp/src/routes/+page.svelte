@@ -25,8 +25,22 @@
     let tooltipX = $state(0);
     let tooltipY = $state(0);
     let configPanelOpen = $state(false);
+    let canvasWidth = $state(1000);
+    let canvasHeight = $state(1000);
+
+    function updateCanvasSize() {
+        if (typeof window === 'undefined') return;
+
+        // Sidebar width is 220px + padding/border
+        const sidebarWidth = 220;
+        canvasWidth = window.innerWidth - sidebarWidth;
+        canvasHeight = window.innerHeight;
+    }
 
     onMount(async () => {
+        updateCanvasSize();
+        window.addEventListener('resize', updateCanvasSize);
+
         await initSimulation();
         // Auto-start the simulation
         handleStart();
@@ -35,6 +49,9 @@
     onDestroy(() => {
         if (animationFrame) {
             cancelAnimationFrame(animationFrame);
+        }
+        if (typeof window !== 'undefined') {
+            window.removeEventListener('resize', updateCanvasSize);
         }
     });
 
@@ -107,9 +124,6 @@
 
 <main onmousemove={handleMouseMove}>
     {#if $isInitialized}
-        <div class="simulation-container">
-            <SimulationCanvas width={1000} height={1000} />
-        </div>
         <aside class="controls-sidebar">
             <ControlPanel
                 onStart={handleStart}
@@ -123,6 +137,9 @@
             <div class="sidebar-spacer"></div>
             <StatusBar />
         </aside>
+        <div class="simulation-container">
+            <SimulationCanvas width={canvasWidth} height={canvasHeight} />
+        </div>
         <DroneTooltip x={tooltipX} y={tooltipY} />
         <PathModeIndicator />
         <ConfigSidePanel isOpen={configPanelOpen} onClose={() => configPanelOpen = false} />
@@ -167,7 +184,7 @@
         display: flex;
         flex-direction: column;
         background: #101014;
-        border-left: 1px solid #1f1f25;
+        border-right: 1px solid #1f1f25;
         padding: 16px;
         box-sizing: border-box;
     }

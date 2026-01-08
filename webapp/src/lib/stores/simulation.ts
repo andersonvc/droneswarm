@@ -66,15 +66,19 @@ export interface VoConfig {
 }
 
 export const voConfig = writable<VoConfig>({
-    lookaheadTime: 1.0,
-    timeSamples: 5,
-    safeDistance: 50.0,
-    detectionRange: 120.0,
-    avoidanceWeight: 0.85,
+    lookaheadTime: 2.5,
+    timeSamples: 10,
+    safeDistance: 90.0,       // 3x collision diameter (30)
+    detectionRange: 250.0,
+    avoidanceWeight: 0.9,
 });
 
 // Waypoint clearance - how close to consider "arrived"
-export const waypointClearance = writable(10.0);
+export const waypointClearance = writable(150.0);
+
+// Consensus protocol for collision avoidance priority
+export type ConsensusProtocol = 'priority_by_id' | 'priority_by_waypoint_dist';
+export const consensusProtocol = writable<ConsensusProtocol>('priority_by_id');
 
 // Legacy - kept for compatibility with AvoidanceSlider
 export const avoidanceLookahead = writable(1.0);
@@ -248,4 +252,9 @@ export function setVoConfig(config: VoConfig): void {
 export function setWaypointClearance(clearance: number): void {
     manager?.setWaypointClearance(clearance);
     waypointClearance.set(clearance);
+}
+
+export function setConsensusProtocol(protocol: ConsensusProtocol): void {
+    manager?.setConsensusProtocol(protocol);
+    consensusProtocol.set(protocol);
 }

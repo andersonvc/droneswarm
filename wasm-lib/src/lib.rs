@@ -12,6 +12,20 @@ use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
 
 // ============================================================================
+// Consensus Protocol
+// ============================================================================
+
+/// Consensus protocol for determining drone priority during collision avoidance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConsensusProtocol {
+    /// Lower drone ID = higher priority (original behavior)
+    #[default]
+    PriorityById,
+    /// Drone closest to its waypoint = higher priority
+    PriorityByWaypointDist,
+}
+
+// ============================================================================
 // Panic Hook Setup
 // ============================================================================
 
@@ -66,6 +80,7 @@ pub struct DroneRenderData {
     pub selected: bool,
     pub objective_type: String,
     pub target: Option<Point>,
+    pub spline_path: Vec<Point>,
 }
 
 #[derive(Clone, Serialize)]
@@ -125,6 +140,7 @@ pub struct Swarm {
     simulation_time: f32,
     speed_multiplier: f32,
     selected_ids: HashSet<u32>,
+    consensus_protocol: ConsensusProtocol,
 }
 
 impl Swarm {
@@ -162,6 +178,7 @@ impl Swarm {
             simulation_time: 0.0,
             speed_multiplier: config.speed_multiplier.unwrap_or(1.0),
             selected_ids: HashSet::new(),
+            consensus_protocol: ConsensusProtocol::default(),
         })
     }
 
@@ -247,12 +264,26 @@ impl Swarm {
 
         let effective_dt = dt * self.speed_multiplier;
 
-        // Priority-Based Consensus: process drones by ID (lower ID = higher priority)
-        // Higher priority drones plan first; lower priority drones see their updated state
+        // Priority-Based Consensus: higher priority drones plan first
+        // Lower priority drones see their updated state
 
-        // Sort drone indices by ID for priority ordering
+        // Sort drone indices based on consensus protocol
         let mut indices: Vec<usize> = (0..self.drones.len()).collect();
-        indices.sort_by_key(|&i| self.drones[i].id);
+
+        match self.consensus_protocol {
+            ConsensusProtocol::PriorityById => {
+                // Lower ID = higher priority
+                indices.sort_by_key(|&i| self.drones[i].id);
+            }
+            ConsensusProtocol::PriorityByWaypointDist => {
+                // Closer to waypoint = higher priority (sort ascending by distance)
+                indices.sort_by(|&a, &b| {
+                    let dist_a = self.distance_to_waypoint(a);
+                    let dist_b = self.distance_to_waypoint(b);
+                    dist_a.partial_cmp(&dist_b).unwrap_or(std::cmp::Ordering::Equal)
+                });
+            }
+        }
 
         // Initialize swarm info with current state
         let mut swarm_info: Vec<DroneInfo> = self
@@ -280,8 +311,8 @@ impl Swarm {
                 let pos_i = self.drones[i].fixed_wing.state().pos;
                 let pos_j = self.drones[j].fixed_wing.state().pos;
 
-                // Use toroidal_distance from bounds
-                let dist = self.lib_bounds.toroidal_distance(pos_i.as_vec2(), pos_j.as_vec2());
+                // Use distance from bounds
+                let dist = self.lib_bounds.distance(pos_i.as_vec2(), pos_j.as_vec2());
 
                 if dist < COLLISION_DISTANCE {
                     let id_i = self.drones[i].id;
@@ -319,6 +350,14 @@ impl Swarm {
                 let state = d.fixed_wing.state();
                 let objective = d.fixed_wing.objective();
 
+                // Get spline path (20 points for smooth visualization)
+                let spline_path: Vec<Point> = d
+                    .fixed_wing
+                    .get_spline_path(20)
+                    .into_iter()
+                    .map(|v| Point { x: v.x, y: v.y })
+                    .collect();
+
                 DroneRenderData {
                     id: d.id,
                     x: state.pos.x(),
@@ -328,6 +367,7 @@ impl Swarm {
                     selected: self.selected_ids.contains(&d.id),
                     objective_type: format!("{:?}", objective.task),
                     target: objective.waypoints.front().map(|&p| p.into()),
+                    spline_path,
                 }
             })
             .collect()
@@ -484,8 +524,8 @@ impl Swarm {
         for drone in &mut self.drones {
             let mut config = *drone.fixed_wing.velocity_obstacle_config();
             config.lookahead_time = lookahead_time.clamp(0.1, 3.0);
-            config.time_samples = time_samples.clamp(1, 10);
-            config.safe_distance = safe_distance.clamp(10.0, 100.0);
+            config.time_samples = time_samples.clamp(5, 30);
+            config.safe_distance = safe_distance.clamp(30.0, 150.0);
             config.detection_range = detection_range.clamp(50.0, 300.0);
             config.avoidance_weight = avoidance_weight.clamp(0.0, 1.0);
             drone.fixed_wing.set_velocity_obstacle_config(config);
@@ -493,9 +533,26 @@ impl Swarm {
     }
 
     pub fn set_waypoint_clearance(&mut self, clearance: f32) {
-        let clearance = clearance.clamp(1.0, 50.0);
+        let clearance = clearance.clamp(1.0, 200.0);
         for drone in &mut self.drones {
             drone.fixed_wing.set_waypoint_clearance(clearance);
+        }
+    }
+
+    pub fn set_consensus_protocol(&mut self, protocol: ConsensusProtocol) {
+        self.consensus_protocol = protocol;
+    }
+
+    /// Helper: get distance from drone to its next waypoint (or MAX if none)
+    fn distance_to_waypoint(&self, drone_idx: usize) -> f32 {
+        let drone = &self.drones[drone_idx];
+        let objective = drone.fixed_wing.objective();
+
+        if let Some(waypoint) = objective.waypoints.front() {
+            let pos = drone.fixed_wing.state().pos;
+            self.lib_bounds.distance(pos.as_vec2(), waypoint.as_vec2())
+        } else {
+            f32::MAX // No waypoint = lowest priority
         }
     }
 }
@@ -654,4 +711,14 @@ pub fn set_vo_config(
 #[wasm_bindgen]
 pub fn set_waypoint_clearance(handle: &mut SwarmHandle, clearance: f32) {
     handle.swarm.set_waypoint_clearance(clearance);
+}
+
+#[wasm_bindgen]
+pub fn set_consensus_protocol(handle: &mut SwarmHandle, protocol: &str) {
+    let protocol = match protocol {
+        "priority_by_id" => ConsensusProtocol::PriorityById,
+        "priority_by_waypoint_dist" => ConsensusProtocol::PriorityByWaypointDist,
+        _ => ConsensusProtocol::PriorityById,
+    };
+    handle.swarm.set_consensus_protocol(protocol);
 }

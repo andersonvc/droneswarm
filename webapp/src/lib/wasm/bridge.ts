@@ -15,6 +15,7 @@ import init, {
     set_avoidance_lookahead,
     set_vo_config,
     set_waypoint_clearance,
+    set_consensus_protocol,
     type SwarmHandle,
 } from 'wasm-lib';
 
@@ -33,6 +34,7 @@ export interface DroneRenderData {
     selected: boolean;
     objectiveType: string;
     target?: Point;
+    splinePath: Point[];
 }
 
 export interface SwarmStatus {
@@ -165,6 +167,11 @@ export class SwarmManager {
     setWaypointClearance(clearance: number): void {
         if (!this.handle) return;
         set_waypoint_clearance(this.handle, clearance);
+    }
+
+    setConsensusProtocol(protocol: string): void {
+        if (!this.handle) return;
+        set_consensus_protocol(this.handle, protocol);
     }
 
     destroy(): void {

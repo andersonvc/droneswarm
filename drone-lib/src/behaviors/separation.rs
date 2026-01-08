@@ -118,8 +118,8 @@ pub fn calculate_separation(
             continue;
         }
 
-        // Calculate toroidal distance to neighbor
-        let delta = bounds.toroidal_delta(self_pos.as_vec2(), other.pos.as_vec2());
+        // Calculate distance to neighbor
+        let delta = bounds.delta(self_pos.as_vec2(), other.pos.as_vec2());
         let distance = delta.magnitude();
 
         // Skip if outside detection radius
@@ -276,21 +276,4 @@ mod tests {
         assert!(steering.x.abs() < 1e-3, "X forces should cancel, got {}", steering.x);
     }
 
-    #[test]
-    fn test_toroidal_distance_at_boundary() {
-        let bounds = Bounds::new(100.0, 100.0).unwrap();
-        let config = SeparationConfig::new(50.0, 50.0, 10.0);
-
-        // Drone at right edge
-        let self_pos = Position::new(95.0, 50.0);
-
-        // Other drone at left edge - only 10 units away toroidally
-        let swarm = vec![create_drone_info(1, 5.0, 50.0)];
-
-        let steering = calculate_separation(self_pos, 0, &swarm, &bounds, &config);
-
-        // Should steer left (toward the nearer wrap-around path away from neighbor)
-        // Since neighbor is "through the right wall", steering should be negative x
-        assert!(steering.x < 0.0, "Expected steering away from wrapped neighbor, got x={}", steering.x);
-    }
 }

@@ -1,5 +1,14 @@
 <script lang="ts">
-    import { voConfig, setVoConfig, waypointClearance, setWaypointClearance, type VoConfig } from '$lib/stores/simulation';
+    import {
+        voConfig,
+        setVoConfig,
+        waypointClearance,
+        setWaypointClearance,
+        consensusProtocol,
+        setConsensusProtocol,
+        type VoConfig,
+        type ConsensusProtocol
+    } from '$lib/stores/simulation';
 
     interface Props {
         isOpen: boolean;
@@ -18,12 +27,14 @@
     });
 
     let localWaypointClearance = $state(10.0);
+    let localConsensusProtocol = $state<ConsensusProtocol>('priority_by_id');
 
     // Sync with store when opened
     $effect(() => {
         if (isOpen) {
             localConfig = { ...$voConfig };
             localWaypointClearance = $waypointClearance;
+            localConsensusProtocol = $consensusProtocol;
         }
     });
 
@@ -33,6 +44,11 @@
 
     function handleWaypointClearanceChange() {
         setWaypointClearance(localWaypointClearance);
+    }
+
+    function handleConsensusProtocolChange(protocol: ConsensusProtocol) {
+        localConsensusProtocol = protocol;
+        setConsensusProtocol(protocol);
     }
 
     function handleClickOutside(e: MouseEvent) {
@@ -78,8 +94,8 @@
                     <input
                         id="timeSamples"
                         type="range"
-                        min="1"
-                        max="10"
+                        min="5"
+                        max="30"
                         step="1"
                         bind:value={localConfig.timeSamples}
                         oninput={handleVoChange}
@@ -94,12 +110,13 @@
                     <input
                         id="safeDistance"
                         type="range"
-                        min="10"
-                        max="100"
-                        step="5"
+                        min="30"
+                        max="150"
+                        step="30"
                         bind:value={localConfig.safeDistance}
                         oninput={handleVoChange}
                     />
+                    <span class="unit-hint">multiples of collision diameter (30)</span>
                 </div>
 
                 <div class="config-row">
@@ -147,7 +164,7 @@
                         id="waypointClearance"
                         type="range"
                         min="1"
-                        max="50"
+                        max="200"
                         step="1"
                         bind:value={localWaypointClearance}
                         oninput={handleWaypointClearanceChange}
@@ -160,13 +177,32 @@
 
             <section>
                 <h3>Consensus Protocol</h3>
-                <div class="config-info">
-                    <p>Priority-Based by ID</p>
-                    <span class="badge">Active</span>
+                <div class="protocol-options">
+                    <button
+                        class="protocol-btn"
+                        class:active={localConsensusProtocol === 'priority_by_id'}
+                        onclick={() => handleConsensusProtocolChange('priority_by_id')}
+                    >
+                        <span class="protocol-name">Priority by ID</span>
+                        <span class="protocol-desc">Lower ID = higher priority</span>
+                    </button>
+                    <button
+                        class="protocol-btn"
+                        class:active={localConsensusProtocol === 'priority_by_waypoint_dist'}
+                        onclick={() => handleConsensusProtocolChange('priority_by_waypoint_dist')}
+                    >
+                        <span class="protocol-name">Priority by Waypoint Dist</span>
+                        <span class="protocol-desc">Closer to waypoint = higher priority</span>
+                    </button>
                 </div>
                 <p class="description">
-                    Lower ID drones have higher priority and plan first.
-                    Higher ID drones avoid lower ID drones.
+                    {#if localConsensusProtocol === 'priority_by_id'}
+                        Lower ID drones have higher priority and plan first.
+                        Higher ID drones yield to lower ID drones.
+                    {:else}
+                        Drones closest to their waypoint have priority.
+                        Others yield to let them through.
+                    {/if}
                 </p>
             </section>
         </aside>
@@ -271,6 +307,14 @@
         font-weight: 500;
     }
 
+    .unit-hint {
+        display: block;
+        color: #4b5563;
+        font-size: 10px;
+        margin-top: 4px;
+        font-family: 'DM Sans', system-ui, sans-serif;
+    }
+
     input[type='range'] {
         width: 100%;
         cursor: pointer;
@@ -331,6 +375,54 @@
         font-size: 12px;
         line-height: 1.5;
         margin: 0;
+        font-family: 'DM Sans', system-ui, sans-serif;
+    }
+
+    .protocol-options {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        margin-bottom: 12px;
+    }
+
+    .protocol-btn {
+        display: flex;
+        flex-direction: column;
+        align-items: flex-start;
+        padding: 12px;
+        background: #1a1a1f;
+        border: 1px solid #2a2a30;
+        border-radius: 6px;
+        cursor: pointer;
+        transition: all 0.15s ease;
+        text-align: left;
+    }
+
+    .protocol-btn:hover:not(.active) {
+        background: #252530;
+        border-color: #3a3a40;
+    }
+
+    .protocol-btn.active {
+        background: #1a2a10;
+        border-color: #9DFF20;
+    }
+
+    .protocol-name {
+        color: #fff;
+        font-size: 13px;
+        font-weight: 500;
+        font-family: 'DM Sans', system-ui, sans-serif;
+        margin-bottom: 4px;
+    }
+
+    .protocol-btn.active .protocol-name {
+        color: #9DFF20;
+    }
+
+    .protocol-desc {
+        color: #6b7280;
+        font-size: 11px;
         font-family: 'DM Sans', system-ui, sans-serif;
     }
 </style>

@@ -7,9 +7,6 @@
         type CoordinationMode,
         type ObjectiveMode
     } from '$lib/stores/simulation';
-    import RouteCreatorModal from './RouteCreatorModal.svelte';
-
-    let routeModalOpen = $state(false);
 
     function setCoordination(mode: CoordinationMode) {
         coordinationMode.set(mode);
@@ -18,7 +15,8 @@
     function setObjective(mode: ObjectiveMode) {
         objectiveMode.set(mode);
         if (mode === 'route') {
-            routeModalOpen = true;
+            // Immediately enter path mode for route placement
+            pathMode.set(true);
         } else if (mode === 'waypoint') {
             // Clear route when switching to waypoint mode
             currentPath.set([]);
@@ -68,8 +66,6 @@
         </div>
     </div>
 </div>
-
-<RouteCreatorModal bind:open={routeModalOpen} />
 
 <style>
     .mode-selector {
