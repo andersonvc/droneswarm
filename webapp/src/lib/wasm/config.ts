@@ -1,3 +1,4 @@
+import { base } from '$app/paths';
 import type { SimulationConfig } from './bridge';
 
 const DEFAULT_CONFIG: SimulationConfig = {
@@ -19,7 +20,7 @@ export async function loadConfig(): Promise<SimulationConfig> {
 
     // 2. Try loading config.json
     try {
-        const response = await fetch('/config.json');
+        const response = await fetch(`${base}/config.json`);
         if (response.ok) {
             const fileConfig = await response.json();
             console.log('Config loaded from config.json');
