@@ -1,10 +1,12 @@
 import type { SimulationConfig } from './bridge';
 
 const DEFAULT_CONFIG: SimulationConfig = {
-    droneCount: 6, // Matches 'small' swarm size
-    spawnPattern: 'random',
-    bounds: { width: 1000, height: 1000 },
-    speedMultiplier: 1.0,
+    droneCount: 50, // Matches 'large' swarm size
+    spawnPattern: { cluster: { center: { x: 550, y: 508 }, radius: 480 } },
+    bounds: { width: 1000, height: 1000 }, // Canvas size in pixels
+    speedMultiplier: 8.0,
+    worldWidthMeters: 2500, // Real-world size in meters
+    worldHeightMeters: 2500,
 };
 
 export async function loadConfig(): Promise<SimulationConfig> {

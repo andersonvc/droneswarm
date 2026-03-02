@@ -1,13 +1,17 @@
 <script lang="ts">
     import {
-        voConfig,
-        setVoConfig,
+        orcaConfig,
+        setOrcaConfig,
         waypointClearance,
         setWaypointClearance,
         consensusProtocol,
         setConsensusProtocol,
-        type VoConfig,
-        type ConsensusProtocol
+        formationConfig,
+        setFormation,
+        formationCommand,
+        type OrcaConfig,
+        type ConsensusProtocol,
+        type FormationType
     } from '$lib/stores/simulation';
 
     interface Props {
@@ -18,28 +22,30 @@
     let { isOpen, onClose }: Props = $props();
 
     // Local state for form inputs
-    let localConfig = $state<VoConfig>({
-        lookaheadTime: 1.0,
-        timeSamples: 5,
-        safeDistance: 50.0,
-        detectionRange: 120.0,
-        avoidanceWeight: 0.85,
+    let localConfig = $state<OrcaConfig>({
+        timeHorizon: 2.0,
+        agentRadius: 20.0,
+        neighborDist: 150.0,
     });
 
     let localWaypointClearance = $state(10.0);
     let localConsensusProtocol = $state<ConsensusProtocol>('priority_by_id');
+    let localFormationType = $state<FormationType>('chevron');
+    let localFormationSpacing = $state(40);
 
     // Sync with store when opened
     $effect(() => {
         if (isOpen) {
-            localConfig = { ...$voConfig };
+            localConfig = { ...$orcaConfig };
             localWaypointClearance = $waypointClearance;
             localConsensusProtocol = $consensusProtocol;
+            localFormationType = $formationConfig.type;
+            localFormationSpacing = $formationConfig.spacing;
         }
     });
 
-    function handleVoChange() {
-        setVoConfig(localConfig);
+    function handleOrcaChange() {
+        setOrcaConfig(localConfig);
     }
 
     function handleWaypointClearanceChange() {
@@ -49,6 +55,24 @@
     function handleConsensusProtocolChange(protocol: ConsensusProtocol) {
         localConsensusProtocol = protocol;
         setConsensusProtocol(protocol);
+    }
+
+    function handleFormationTypeChange(type: FormationType) {
+        localFormationType = type;
+        setFormation(type, localFormationSpacing);
+    }
+
+    function handleFormationSpacingChange() {
+        if (localFormationType !== 'none') {
+            setFormation(localFormationType, localFormationSpacing);
+        }
+    }
+
+    function handleFormationCommand(cmd: 'contract' | 'expand' | 'disperse') {
+        formationCommand(cmd);
+        if (cmd === 'disperse') {
+            localFormationType = 'none';
+        }
     }
 
     function handleClickOutside(e: MouseEvent) {
@@ -68,86 +92,53 @@
             </header>
 
             <section>
-                <h3>Velocity Obstacle</h3>
+                <h3>Collision Avoidance (ORCA)</h3>
 
                 <div class="config-row">
-                    <label for="lookahead">
-                        Lookahead Time
-                        <span class="value">{localConfig.lookaheadTime.toFixed(2)}s</span>
+                    <label for="timeHorizon">
+                        Time Horizon
+                        <span class="value">{localConfig.timeHorizon.toFixed(1)}s</span>
                     </label>
                     <input
-                        id="lookahead"
+                        id="timeHorizon"
                         type="range"
-                        min="0.1"
-                        max="3"
-                        step="0.1"
-                        bind:value={localConfig.lookaheadTime}
-                        oninput={handleVoChange}
+                        min="0.5"
+                        max="5"
+                        step="0.5"
+                        bind:value={localConfig.timeHorizon}
+                        oninput={handleOrcaChange}
                     />
                 </div>
 
                 <div class="config-row">
-                    <label for="timeSamples">
-                        Trajectory Samples
-                        <span class="value">{localConfig.timeSamples}</span>
+                    <label for="agentRadius">
+                        Agent Radius
+                        <span class="value">{localConfig.agentRadius.toFixed(0)}</span>
                     </label>
                     <input
-                        id="timeSamples"
+                        id="agentRadius"
                         type="range"
-                        min="5"
-                        max="30"
-                        step="1"
-                        bind:value={localConfig.timeSamples}
-                        oninput={handleVoChange}
+                        min="10"
+                        max="50"
+                        step="5"
+                        bind:value={localConfig.agentRadius}
+                        oninput={handleOrcaChange}
                     />
                 </div>
 
                 <div class="config-row">
-                    <label for="safeDistance">
-                        Safe Distance
-                        <span class="value">{localConfig.safeDistance.toFixed(0)}</span>
+                    <label for="neighborDist">
+                        Neighbor Distance
+                        <span class="value">{localConfig.neighborDist.toFixed(0)}</span>
                     </label>
                     <input
-                        id="safeDistance"
+                        id="neighborDist"
                         type="range"
-                        min="30"
-                        max="150"
-                        step="30"
-                        bind:value={localConfig.safeDistance}
-                        oninput={handleVoChange}
-                    />
-                    <span class="unit-hint">multiples of collision diameter (30)</span>
-                </div>
-
-                <div class="config-row">
-                    <label for="detectionRange">
-                        Detection Range
-                        <span class="value">{localConfig.detectionRange.toFixed(0)}</span>
-                    </label>
-                    <input
-                        id="detectionRange"
-                        type="range"
-                        min="50"
+                        min="10"
                         max="300"
                         step="10"
-                        bind:value={localConfig.detectionRange}
-                        oninput={handleVoChange}
-                    />
-                </div>
-
-                <div class="config-row">
-                    <label for="avoidanceWeight">
-                        Avoidance Weight
-                        <span class="value">{localConfig.avoidanceWeight.toFixed(2)}</span>
-                    </label>
-                    <input
-                        id="avoidanceWeight"
-                        type="range"
-                        min="0"
-                        max="1"
-                        step="0.05"
-                        bind:value={localConfig.avoidanceWeight}
-                        oninput={handleVoChange}
+                        bind:value={localConfig.neighborDist}
+                        oninput={handleOrcaChange}
                     />
                 </div>
             </section>
@@ -202,6 +193,118 @@
                     {:else}
                         Drones closest to their waypoint have priority.
                         Others yield to let them through.
+                    {/if}
+                </p>
+            </section>
+
+            <section>
+                <h3>Formation</h3>
+                <div class="formation-types">
+                    <button
+                        class="formation-btn"
+                        class:active={localFormationType === 'none'}
+                        onclick={() => handleFormationTypeChange('none')}
+                    >
+                        None
+                    </button>
+                    <button
+                        class="formation-btn"
+                        class:active={localFormationType === 'line'}
+                        onclick={() => handleFormationTypeChange('line')}
+                    >
+                        Line
+                    </button>
+                    <button
+                        class="formation-btn"
+                        class:active={localFormationType === 'vee'}
+                        onclick={() => handleFormationTypeChange('vee')}
+                    >
+                        Vee
+                    </button>
+                    <button
+                        class="formation-btn"
+                        class:active={localFormationType === 'chevron'}
+                        onclick={() => handleFormationTypeChange('chevron')}
+                    >
+                        Chevron
+                    </button>
+                    <button
+                        class="formation-btn"
+                        class:active={localFormationType === 'diamond'}
+                        onclick={() => handleFormationTypeChange('diamond')}
+                    >
+                        Diamond
+                    </button>
+                    <button
+                        class="formation-btn"
+                        class:active={localFormationType === 'circle'}
+                        onclick={() => handleFormationTypeChange('circle')}
+                    >
+                        Circle
+                    </button>
+                    <button
+                        class="formation-btn"
+                        class:active={localFormationType === 'grid'}
+                        onclick={() => handleFormationTypeChange('grid')}
+                    >
+                        Grid
+                    </button>
+                </div>
+
+                {#if localFormationType !== 'none'}
+                    <div class="config-row">
+                        <label for="formationSpacing">
+                            Spacing
+                            <span class="value">{localFormationSpacing}</span>
+                        </label>
+                        <input
+                            id="formationSpacing"
+                            type="range"
+                            min="30"
+                            max="150"
+                            step="10"
+                            bind:value={localFormationSpacing}
+                            oninput={handleFormationSpacingChange}
+                        />
+                    </div>
+
+                    <div class="formation-commands">
+                        <button
+                            class="cmd-btn"
+                            onclick={() => handleFormationCommand('contract')}
+                        >
+                            Contract
+                        </button>
+                        <button
+                            class="cmd-btn"
+                            onclick={() => handleFormationCommand('expand')}
+                        >
+                            Expand
+                        </button>
+                        <button
+                            class="cmd-btn cmd-danger"
+                            onclick={() => handleFormationCommand('disperse')}
+                        >
+                            Disperse
+                        </button>
+                    </div>
+                {/if}
+
+                <p class="description">
+                    {#if localFormationType === 'none'}
+                        No formation active. Select a formation type to organize drones.
+                    {:else if localFormationType === 'line'}
+                        Drones arranged in a horizontal line.
+                    {:else if localFormationType === 'vee'}
+                        V-shaped wedge formation with leader at front.
+                    {:else if localFormationType === 'chevron'}
+                        Nested V layers, each row adds one more drone per side.
+                    {:else if localFormationType === 'diamond'}
+                        Diamond/rhombus formation with leader at front and tail at back.
+                    {:else if localFormationType === 'circle'}
+                        Drones arranged in a circle.
+                    {:else if localFormationType === 'grid'}
+                        Drones arranged in a grid pattern.
                     {/if}
                 </p>
             </section>
@@ -424,5 +527,70 @@
         color: #6b7280;
         font-size: 11px;
         font-family: 'DM Sans', system-ui, sans-serif;
+    }
+
+    .formation-types {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        margin-bottom: 16px;
+    }
+
+    .formation-btn {
+        padding: 8px 12px;
+        background: #1a1a1f;
+        border: 1px solid #2a2a30;
+        border-radius: 6px;
+        cursor: pointer;
+        transition: all 0.15s ease;
+        color: #9ca3af;
+        font-size: 12px;
+        font-family: 'DM Sans', system-ui, sans-serif;
+        font-weight: 500;
+    }
+
+    .formation-btn:hover:not(.active) {
+        background: #252530;
+        border-color: #3a3a40;
+        color: #fff;
+    }
+
+    .formation-btn.active {
+        background: #1a2a10;
+        border-color: #9DFF20;
+        color: #9DFF20;
+    }
+
+    .formation-commands {
+        display: flex;
+        gap: 8px;
+        margin-top: 12px;
+        margin-bottom: 12px;
+    }
+
+    .cmd-btn {
+        flex: 1;
+        padding: 8px 12px;
+        background: #1a1a1f;
+        border: 1px solid #2a2a30;
+        border-radius: 6px;
+        cursor: pointer;
+        transition: all 0.15s ease;
+        color: #9ca3af;
+        font-size: 11px;
+        font-family: 'DM Sans', system-ui, sans-serif;
+        font-weight: 500;
+    }
+
+    .cmd-btn:hover {
+        background: #252530;
+        border-color: #3a3a40;
+        color: #fff;
+    }
+
+    .cmd-btn.cmd-danger:hover {
+        background: #2a1a1a;
+        border-color: #ff4444;
+        color: #ff4444;
     }
 </style>

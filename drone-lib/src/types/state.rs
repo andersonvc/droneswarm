@@ -1,37 +1,23 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use super::{Acceleration, Heading, Position, Velocity};
+use super::{units, Acceleration, Heading, Position, Velocity};
 use crate::types::error::{DroneError, DroneResult};
 
-/// Objective types for drone behavior
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum ObjectiveType {
-    ReachWaypoint,
-    FollowRoute, // Like ReachWaypoint but loops back to start
-    FollowTarget,
-    Loiter,
+/// Drone objective – each variant carries only the data it needs.
+#[derive(Debug, Clone, Default)]
+pub enum Objective {
+    /// Inactive state, no movement.
+    #[default]
     Sleep,
-}
-
-/// Drone objective containing task and waypoints
-#[derive(Debug, Clone)]
-pub struct Objective {
-    pub task: ObjectiveType,
-    pub waypoints: VecDeque<Position>,
-    pub route: Option<Arc<[Position]>>, // Shared route for looping
-    pub targets: Option<Vec<Position>>,
-}
-
-impl Default for Objective {
-    fn default() -> Self {
-        Objective {
-            task: ObjectiveType::Sleep,
-            waypoints: VecDeque::new(),
-            route: None,
-            targets: None,
-        }
-    }
+    /// Navigate directly to waypoints, stop when done.
+    ReachWaypoint { waypoints: VecDeque<Position> },
+    /// Follow a route indefinitely, looping back to start.
+    FollowRoute { waypoints: VecDeque<Position>, route: Arc<[Position]> },
+    /// Track moving targets.
+    FollowTarget { targets: Vec<Position> },
+    /// Hold position or patrol area.
+    Loiter { center: Option<Position> },
 }
 
 /// Drone state containing position, heading, velocity, and acceleration
@@ -61,6 +47,8 @@ pub struct DroneInfo {
     pub pos: Position,
     pub hdg: Heading,
     pub vel: Velocity,
+    /// Whether this drone is a formation leader (doesn't do ORCA avoidance)
+    pub is_formation_leader: bool,
 }
 
 impl DroneInfo {
@@ -70,8 +58,27 @@ impl DroneInfo {
             pos: state.pos,
             hdg: state.hdg,
             vel: state.vel,
+            is_formation_leader: false,
         }
     }
+
+    /// Create DroneInfo with leader status
+    pub fn new_with_leader(uid: usize, state: &State, is_formation_leader: bool) -> Self {
+        DroneInfo {
+            uid,
+            pos: state.pos,
+            hdg: state.hdg,
+            vel: state.vel,
+            is_formation_leader,
+        }
+    }
+}
+
+/// Filter swarm to exclude a specific drone by ID.
+///
+/// Returns an iterator over all `DroneInfo` entries except the one with `self_id`.
+pub fn neighbors_excluding(swarm: &[DroneInfo], self_id: usize) -> impl Iterator<Item = &DroneInfo> {
+    swarm.iter().filter(move |d| d.uid != self_id)
 }
 
 /// Drone performance features (flight parameters)
@@ -131,9 +138,9 @@ impl DronePerfFeatures {
 impl Default for DronePerfFeatures {
     fn default() -> Self {
         DronePerfFeatures {
-            max_vel: 120.0,
-            max_acc: 21.0,
-            max_turn_rate: 4.0,
+            max_vel: units::DEFAULT_MAX_VELOCITY,
+            max_acc: units::DEFAULT_MAX_ACCELERATION,
+            max_turn_rate: units::DEFAULT_MAX_TURN_RATE,
         }
     }
 }
@@ -158,7 +165,6 @@ mod tests {
     #[test]
     fn test_objective_default() {
         let obj = Objective::default();
-        assert_eq!(obj.task, ObjectiveType::Sleep);
-        assert!(obj.waypoints.is_empty());
+        assert!(matches!(obj, Objective::Sleep));
     }
 }

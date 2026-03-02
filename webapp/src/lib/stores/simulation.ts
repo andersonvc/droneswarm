@@ -19,7 +19,7 @@ export const status = writable<SwarmStatus>({
     simulationTime: 0,
     droneCount: 0,
     selectedCount: 0,
-    speedMultiplier: 1.0,
+    speedMultiplier: 8.0,
     isValid: false,
 });
 
@@ -34,11 +34,11 @@ export const activeRoute = writable<Point[]>([]);
 export type CoordinationMode = 'individual' | 'swarm';
 export type ObjectiveMode = 'waypoint' | 'route';
 export const coordinationMode = writable<CoordinationMode>('swarm');
-export const objectiveMode = writable<ObjectiveMode>('waypoint');
+export const objectiveMode = writable<ObjectiveMode>('route');
 
 // Swarm size configuration
 export type SwarmSize = 'small' | 'medium' | 'large';
-export const swarmSize = writable<SwarmSize>('small');
+export const swarmSize = writable<SwarmSize>('large');
 
 export const SWARM_SIZE_COUNTS: Record<SwarmSize, number> = {
     small: 6,
@@ -56,21 +56,17 @@ export const flightParams = writable({
     maxTurnRate: 4
 });
 
-// Velocity Obstacle config store
-export interface VoConfig {
-    lookaheadTime: number;
-    timeSamples: number;
-    safeDistance: number;
-    detectionRange: number;
-    avoidanceWeight: number;
+// ORCA collision avoidance config store
+export interface OrcaConfig {
+    timeHorizon: number;
+    agentRadius: number;
+    neighborDist: number;
 }
 
-export const voConfig = writable<VoConfig>({
-    lookaheadTime: 2.5,
-    timeSamples: 10,
-    safeDistance: 90.0,       // 3x collision diameter (30)
-    detectionRange: 250.0,
-    avoidanceWeight: 0.9,
+export const orcaConfig = writable<OrcaConfig>({
+    timeHorizon: 2.0,         // Seconds to look ahead for collision
+    agentRadius: 20.0,        // Collision radius per agent
+    neighborDist: 80.0,       // How far to look for neighbors
 });
 
 // Waypoint clearance - how close to consider "arrived"
@@ -79,6 +75,19 @@ export const waypointClearance = writable(150.0);
 // Consensus protocol for collision avoidance priority
 export type ConsensusProtocol = 'priority_by_id' | 'priority_by_waypoint_dist';
 export const consensusProtocol = writable<ConsensusProtocol>('priority_by_id');
+
+// Formation configuration
+export type FormationType = 'none' | 'line' | 'vee' | 'chevron' | 'diamond' | 'circle' | 'grid';
+export interface FormationConfig {
+    type: FormationType;
+    spacing: number;
+    leaderId?: number;
+}
+export const formationConfig = writable<FormationConfig>({
+    type: 'chevron',
+    spacing: 40,
+    leaderId: undefined,
+});
 
 // Legacy - kept for compatibility with AvoidanceSlider
 export const avoidanceLookahead = writable(1.0);
@@ -93,6 +102,18 @@ export async function initSimulation(config?: SimulationConfig): Promise<void> {
     await manager.initialize(finalConfig);
     isInitialized.set(true);
     updateRenderState();
+
+    // Set default patrol route (hourglass/bowtie — two crossing triangles)
+    const defaultRoute = [
+        { x: 200, y: 100 },  // 1: top-left
+        { x: 550, y: 500 },  // 2: center
+        { x: 900, y:  50 },  // 3: top-right
+        { x: 850, y: 900 },  // 4: bottom-right
+        { x: 550, y: 650 },  // 5: center-lower
+        { x: 250, y: 850 },  // 6: bottom-left
+    ];
+    activeRoute.set(defaultRoute);
+    currentPath.set(defaultRoute);
 }
 
 export async function reinitializeWithSize(size: SwarmSize): Promise<void> {
@@ -238,15 +259,13 @@ export function setAvoidanceLookahead(lookahead: number): void {
     avoidanceLookahead.set(lookahead);
 }
 
-export function setVoConfig(config: VoConfig): void {
-    manager?.setVoConfig(
-        config.lookaheadTime,
-        config.timeSamples,
-        config.safeDistance,
-        config.detectionRange,
-        config.avoidanceWeight
+export function setOrcaConfig(config: OrcaConfig): void {
+    manager?.setOrcaConfig(
+        config.timeHorizon,
+        config.agentRadius,
+        config.neighborDist
     );
-    voConfig.set(config);
+    orcaConfig.set(config);
 }
 
 export function setWaypointClearance(clearance: number): void {
@@ -257,4 +276,32 @@ export function setWaypointClearance(clearance: number): void {
 export function setConsensusProtocol(protocol: ConsensusProtocol): void {
     manager?.setConsensusProtocol(protocol);
     consensusProtocol.set(protocol);
+}
+
+export function setFormation(type: FormationType, spacing: number, leaderId?: number): void {
+    if (type === 'none') {
+        manager?.clearFormation();
+    } else {
+        manager?.setFormation(type, spacing, leaderId);
+    }
+    formationConfig.set({ type, spacing, leaderId });
+    updateRenderState();
+}
+
+export function clearFormation(): void {
+    manager?.clearFormation();
+    formationConfig.update(config => ({ ...config, type: 'none' }));
+    updateRenderState();
+}
+
+export function formationCommand(command: 'hold' | 'advance' | 'disperse' | 'contract' | 'expand'): void {
+    manager?.formationCommand(command);
+    if (command === 'disperse') {
+        formationConfig.update(config => ({ ...config, type: 'none' }));
+    }
+    updateRenderState();
+}
+
+export function updateFormation(): void {
+    manager?.updateFormation();
 }

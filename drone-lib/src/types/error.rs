@@ -1,10 +1,12 @@
-/// Errors that can occur in drone operations
+/// Errors that can occur in drone operations.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DroneError {
-    /// Invalid bounds (width or height <= 0)
+    /// Invalid bounds (width or height <= 0).
     InvalidBounds { width: f32, height: f32 },
-    /// Invalid flight parameter
+    /// Invalid flight parameter (value must be > 0).
     InvalidFlightParam { param: &'static str, value: f32 },
+    /// Invalid formation configuration.
+    InvalidFormation { reason: String },
 }
 
 impl std::fmt::Display for DroneError {
@@ -15,6 +17,9 @@ impl std::fmt::Display for DroneError {
             }
             DroneError::InvalidFlightParam { param, value } => {
                 write!(f, "Invalid flight parameter {}: {}", param, value)
+            }
+            DroneError::InvalidFormation { reason } => {
+                write!(f, "Invalid formation: {}", reason)
             }
         }
     }

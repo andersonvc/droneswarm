@@ -13,9 +13,13 @@ import init, {
     get_drone_at,
     set_flight_params,
     set_avoidance_lookahead,
-    set_vo_config,
+    set_orca_config,
     set_waypoint_clearance,
     set_consensus_protocol,
+    set_formation,
+    clear_formation,
+    formation_command,
+    update_formation,
     type SwarmHandle,
 } from 'wasm-lib';
 
@@ -35,6 +39,8 @@ export interface DroneRenderData {
     objectiveType: string;
     target?: Point;
     splinePath: Point[];
+    routePath: Point[];
+    planningPath: Point[];
 }
 
 export interface SwarmStatus {
@@ -54,6 +60,10 @@ export interface SimulationConfig {
         | { custom: { positions: Point[] } };
     bounds: { width: number; height: number };
     speedMultiplier?: number;
+    /** World width in meters. Default: 500 */
+    worldWidthMeters?: number;
+    /** World height in meters. Default: 500 */
+    worldHeightMeters?: number;
 }
 
 let wasmInitialized = false;
@@ -89,7 +99,7 @@ export class SwarmManager {
                 simulationTime: 0,
                 droneCount: 0,
                 selectedCount: 0,
-                speedMultiplier: 1.0,
+                speedMultiplier: 8.0,
                 isValid: false,
             };
         }
@@ -146,21 +156,17 @@ export class SwarmManager {
         set_avoidance_lookahead(this.handle, lookaheadTime);
     }
 
-    setVoConfig(
-        lookaheadTime: number,
-        timeSamples: number,
-        safeDistance: number,
-        detectionRange: number,
-        avoidanceWeight: number
+    setOrcaConfig(
+        timeHorizon: number,
+        agentRadius: number,
+        neighborDist: number
     ): void {
         if (!this.handle) return;
-        set_vo_config(
+        set_orca_config(
             this.handle,
-            lookaheadTime,
-            timeSamples,
-            safeDistance,
-            detectionRange,
-            avoidanceWeight
+            timeHorizon,
+            agentRadius,
+            neighborDist
         );
     }
 
@@ -172,6 +178,26 @@ export class SwarmManager {
     setConsensusProtocol(protocol: string): void {
         if (!this.handle) return;
         set_consensus_protocol(this.handle, protocol);
+    }
+
+    setFormation(formationType: string, spacing: number, leaderId?: number): void {
+        if (!this.handle) return;
+        set_formation(this.handle, formationType, spacing, leaderId ?? null);
+    }
+
+    clearFormation(): void {
+        if (!this.handle) return;
+        clear_formation(this.handle);
+    }
+
+    formationCommand(command: string): void {
+        if (!this.handle) return;
+        formation_command(this.handle, command);
+    }
+
+    updateFormation(): void {
+        if (!this.handle) return;
+        update_formation(this.handle);
     }
 
     destroy(): void {

@@ -28,6 +28,10 @@ rm -rf pkg
 wasm-pack build --target web
 
 echo ""
-echo "✨ Starting dev server..."
+echo "📦 Reinstalling wasm-lib..."
 cd "$WEBAPP_DIR"
+npm install wasm-lib
+
+echo ""
+echo "✨ Starting dev server..."
 npm run dev

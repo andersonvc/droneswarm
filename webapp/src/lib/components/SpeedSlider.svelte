@@ -1,7 +1,7 @@
 <script lang="ts">
     import { status, setSpeed } from '$lib/stores/simulation';
 
-    const speeds = [0.25, 0.5, 1, 2, 4];
+    const speeds = [1, 2, 4, 8, 16];
 
     function handleChange(e: Event) {
         const index = parseInt((e.target as HTMLInputElement).value, 10);

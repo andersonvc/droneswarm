@@ -5,27 +5,37 @@
 
 use crate::types::{Bounds, DroneInfo, Position, Vec2};
 
-/// Physical collision radius of a drone (world units).
-/// Two drones are considered colliding if their centers are within 2x this distance.
-pub const COLLISION_RADIUS: f32 = 10.0;
+/// Separation behavior default constants.
+pub(crate) mod defaults {
+    use super::super::super::types::units::DRONE_RADIUS;
 
-/// Default multiplier for minimum separation distance.
-/// `min_distance = COLLISION_RADIUS * MIN_DISTANCE_MULTIPLIER`
-const DEFAULT_MIN_DISTANCE_MULTIPLIER: f32 = 2.0;
+    /// Physical collision radius (meters).
+    pub const COLLISION_RADIUS: f32 = DRONE_RADIUS;
+
+    /// Detection radius for separation steering (meters).
+    pub const DETECTION_RADIUS: f32 = 5.0;
+
+    /// Minimum safe distance between drones (meters).
+    pub const MIN_DISTANCE: f32 = 1.0;
+
+    /// Separation force strength scaling factor.
+    pub const STRENGTH: f32 = 75.0;
+}
+
+/// Physical collision radius of a drone (meters).
+/// Two drones are considered colliding if their centers are within 2x this distance.
+pub const COLLISION_RADIUS: f32 = defaults::COLLISION_RADIUS;
 
 /// Configuration for separation behavior.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SeparationConfig {
-    /// Detection radius - drones within this distance trigger avoidance.
-    /// Units: world units (same as position).
+    /// Detection radius - drones within this distance trigger avoidance (meters).
     pub radius: f32,
 
     /// Force multiplier - higher values create stronger avoidance.
-    /// Typical range: 1.0 - 100.0
     pub strength: f32,
 
-    /// Minimum distance to maintain from other drones.
-    /// Should be a multiple of [`COLLISION_RADIUS`] to ensure safe separation.
+    /// Minimum distance to maintain from other drones (meters).
     /// Below this distance, avoidance force increases dramatically.
     pub min_distance: f32,
 }
@@ -33,9 +43,9 @@ pub struct SeparationConfig {
 impl Default for SeparationConfig {
     fn default() -> Self {
         SeparationConfig {
-            radius: 100.0,
-            strength: 150.0,
-            min_distance: COLLISION_RADIUS * DEFAULT_MIN_DISTANCE_MULTIPLIER,
+            radius: defaults::DETECTION_RADIUS,
+            strength: defaults::STRENGTH,
+            min_distance: defaults::MIN_DISTANCE,
         }
     }
 }
@@ -112,12 +122,7 @@ pub fn calculate_separation(
     let mut steering = Vec2::new(0.0, 0.0);
     let mut neighbor_count = 0;
 
-    for other in swarm {
-        // Skip self
-        if other.uid == self_id {
-            continue;
-        }
-
+    for other in crate::types::neighbors_excluding(swarm, self_id) {
         // Calculate distance to neighbor
         let delta = bounds.delta(self_pos.as_vec2(), other.pos.as_vec2());
         let distance = delta.magnitude();
@@ -128,18 +133,18 @@ pub fn calculate_separation(
         }
 
         // Calculate repulsion vector (pointing away from neighbor)
-        // Normalize delta and invert direction
         let away = Vec2::new(-delta.x / distance, -delta.y / distance);
 
         // Force increases as distance decreases
         // Linear falloff: force = strength * (1 - distance/radius)
-        // This gives more consistent avoidance across the detection range
         let normalized_dist = (distance / config.radius).clamp(0.0, 1.0);
         let force_magnitude = config.strength * (1.0 - normalized_dist);
 
         // Extra boost when very close (below min_distance)
+        /// Emergency multiplier applied when drones are closer than min_distance.
+        const EMERGENCY_FORCE_MULTIPLIER: f32 = 2.0;
         let force_magnitude = if distance < config.min_distance {
-            force_magnitude * 2.0
+            force_magnitude * EMERGENCY_FORCE_MULTIPLIER
         } else {
             force_magnitude
         };
@@ -162,24 +167,11 @@ pub fn calculate_separation(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Heading, Velocity};
-
-    fn create_drone_info(uid: usize, x: f32, y: f32) -> DroneInfo {
-        DroneInfo {
-            uid,
-            pos: Position::new(x, y),
-            hdg: Heading::new(0.0),
-            vel: Velocity::zero(),
-        }
-    }
-
-    fn create_bounds() -> Bounds {
-        Bounds::new(1000.0, 1000.0).unwrap()
-    }
+    use crate::test_utils::fixtures::{create_drone_info, create_test_bounds};
 
     #[test]
     fn test_empty_swarm_returns_zero() {
-        let bounds = create_bounds();
+        let bounds = create_test_bounds();
         let config = SeparationConfig::default();
         let self_pos = Position::new(100.0, 100.0);
 
@@ -191,7 +183,7 @@ mod tests {
 
     #[test]
     fn test_excludes_self() {
-        let bounds = create_bounds();
+        let bounds = create_test_bounds();
         let config = SeparationConfig::default();
         let self_pos = Position::new(100.0, 100.0);
 
@@ -206,7 +198,7 @@ mod tests {
 
     #[test]
     fn test_drone_outside_radius_ignored() {
-        let bounds = create_bounds();
+        let bounds = create_test_bounds();
         let config = SeparationConfig::new(50.0, 100.0, 10.0);
         let self_pos = Position::new(100.0, 100.0);
 
@@ -221,7 +213,7 @@ mod tests {
 
     #[test]
     fn test_steers_away_from_neighbor() {
-        let bounds = create_bounds();
+        let bounds = create_test_bounds();
         let config = SeparationConfig::new(100.0, 50.0, 10.0);
         let self_pos = Position::new(100.0, 100.0);
 
@@ -237,7 +229,7 @@ mod tests {
 
     #[test]
     fn test_closer_drone_stronger_force() {
-        let bounds = create_bounds();
+        let bounds = create_test_bounds();
         let config = SeparationConfig::new(100.0, 50.0, 5.0);
         let self_pos = Position::new(100.0, 100.0);
 
@@ -260,7 +252,7 @@ mod tests {
 
     #[test]
     fn test_multiple_neighbors_averaged() {
-        let bounds = create_bounds();
+        let bounds = create_test_bounds();
         let config = SeparationConfig::new(100.0, 50.0, 10.0);
         let self_pos = Position::new(100.0, 100.0);
 

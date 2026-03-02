@@ -7,6 +7,27 @@
 
 use crate::types::{Bounds, DroneInfo, Heading, Position, State};
 
+/// Velocity Obstacle algorithm default constants.
+pub(crate) mod defaults {
+    /// Lookahead time for collision prediction (seconds).
+    pub const LOOKAHEAD_TIME: f32 = 2.5;
+
+    /// Safe separation distance (meters).
+    pub const SAFE_DISTANCE: f32 = 1.5;
+
+    /// Detection range for early awareness (meters).
+    pub const DETECTION_RANGE: f32 = 5.0;
+
+    /// Avoidance weight (0.0-1.0).
+    pub const AVOIDANCE_WEIGHT: f32 = 0.9;
+
+    /// Number of velocity samples for optimization.
+    pub const NUM_SAMPLES: usize = 25;
+
+    /// Number of time samples for trajectory prediction.
+    pub const TIME_SAMPLES: usize = 10;
+}
+
 /// Configuration for velocity obstacle avoidance.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct VelocityObstacleConfig {
@@ -22,26 +43,26 @@ pub struct VelocityObstacleConfig {
     /// More samples = catches crossing paths better.
     pub time_samples: usize,
 
-    /// Minimum safe separation distance between drones.
+    /// Minimum safe separation distance between drones (meters).
     pub safe_distance: f32,
 
     /// How strongly to penalize potential collisions (0.0 - 1.0).
     /// Higher = more aggressive avoidance.
     pub avoidance_weight: f32,
 
-    /// Maximum detection range for considering other drones.
+    /// Maximum detection range for considering other drones (meters).
     pub detection_range: f32,
 }
 
 impl Default for VelocityObstacleConfig {
     fn default() -> Self {
         VelocityObstacleConfig {
-            lookahead_time: 2.5,       // Increased: more time to react
-            num_samples: 25,            // Heading samples to evaluate
-            time_samples: 10,           // Trajectory samples along path
-            safe_distance: 90.0,        // 3x collision diameter (30)
-            avoidance_weight: 0.9,      // Prioritize avoidance
-            detection_range: 250.0,     // Early awareness range
+            lookahead_time: defaults::LOOKAHEAD_TIME,
+            num_samples: defaults::NUM_SAMPLES,
+            time_samples: defaults::TIME_SAMPLES,
+            safe_distance: defaults::SAFE_DISTANCE,
+            avoidance_weight: defaults::AVOIDANCE_WEIGHT,
+            detection_range: defaults::DETECTION_RANGE,
         }
     }
 }
@@ -162,97 +183,19 @@ pub fn calculate_velocity_obstacle(
         let heading_offset = -max_heading_change + step * i as f32;
         let candidate_heading = Heading::new(self_state.hdg.radians() + heading_offset);
 
-        // Check separation at MULTIPLE time samples along the trajectory
-        // This catches crossing paths, not just end-point distance
-        let mut min_separation = f32::MAX;
-        let mut closest_threat_on_right = false;
-
-        for neighbor in &nearby {
-            let neighbor_speed = neighbor.vel.as_vec2().magnitude();
-
-            // Check at multiple time points to find minimum separation
-            for t_idx in 1..=config.time_samples {
-                let t = config.lookahead_time * (t_idx as f32 / config.time_samples as f32);
-
-                let predicted_self = predict_position(
-                    self_state.pos,
-                    candidate_heading,
-                    current_speed,
-                    t,
-                    bounds,
-                );
-
-                let predicted_neighbor = predict_position(
-                    neighbor.pos,
-                    neighbor.hdg,
-                    neighbor_speed,
-                    t,
-                    bounds,
-                );
-
-                let separation = bounds.distance(
-                    predicted_self.as_vec2(),
-                    predicted_neighbor.as_vec2(),
-                );
-
-                if separation < min_separation {
-                    min_separation = separation;
-                    // Determine if this neighbor is on our right or left
-                    let to_neighbor = bounds.delta(
-                        self_state.pos.as_vec2(),
-                        neighbor.pos.as_vec2(),
-                    );
-                    let heading_vec = self_state.hdg.to_vec2();
-                    let cross = heading_vec.x * to_neighbor.y - heading_vec.y * to_neighbor.x;
-                    closest_threat_on_right = cross < 0.0;
-                }
-            }
-        }
+        let min_separation = compute_min_separation(
+            self_state.pos, candidate_heading, current_speed, &nearby, bounds, config,
+        );
 
         min_separation_found = min_separation_found.min(min_separation);
 
-        // Check if this would cause a collision
         if min_separation < config.safe_distance {
             threat_detected = true;
         }
 
-        // Score this heading:
-        // - Higher is better
-        // - Penalize deviation from desired heading
-        // - Reward separation from neighbors
-        let heading_error = (candidate_heading.radians() - desired_heading.radians()).abs();
-        let normalized_error = heading_error / std::f32::consts::PI; // 0 to 1
-
-        let separation_score = if min_separation < config.safe_distance {
-            // Collision zone: heavily penalize
-            -1.0 + (min_separation / config.safe_distance)
-        } else {
-            // Safe zone: diminishing returns for extra distance
-            (min_separation / config.safe_distance).min(2.0) / 2.0
-        };
-
-        // Combined score: balance goal-seeking vs avoidance
-        let goal_score = 1.0 - normalized_error;
-        let mut score = goal_score * (1.0 - config.avoidance_weight)
-            + separation_score * config.avoidance_weight;
-
-        // CONSISTENT TURN DIRECTION: Use deterministic rules to avoid "reciprocal dance"
-        // Rule: ALWAYS turn RIGHT (negative heading offset) when threatened
-        // This is similar to ICAO flight rules where aircraft turn right on head-on approach
-        // Both drones turning right means they pass each other safely (left-to-left)
-        if min_separation < config.safe_distance * 2.0 {
-            let threat_proximity = 1.0 - (min_separation / (config.safe_distance * 2.0));
-            let turn_right_bias = if heading_offset < 0.0 {
-                // Turning right - strongly prefer this
-                0.3 * threat_proximity
-            } else if heading_offset > 0.0 {
-                // Turning left - penalize this
-                -0.2 * threat_proximity
-            } else {
-                0.0
-            };
-            score += turn_right_bias;
-        }
+        let score = score_heading_candidate(
+            heading_offset, min_separation, desired_heading, candidate_heading, config,
+        );
 
         if score > best_score {
             best_score = score;
@@ -276,13 +219,92 @@ pub fn calculate_velocity_obstacle(
     }
 }
 
+/// Compute the minimum separation distance between a candidate heading
+/// and all nearby drones over the lookahead horizon.
+fn compute_min_separation(
+    self_pos: Position,
+    candidate_heading: Heading,
+    current_speed: f32,
+    nearby: &[&DroneInfo],
+    bounds: &Bounds,
+    config: &VelocityObstacleConfig,
+) -> f32 {
+    let mut min_separation = f32::MAX;
+
+    for neighbor in nearby {
+        let neighbor_speed = neighbor.vel.as_vec2().magnitude();
+
+        for t_idx in 1..=config.time_samples {
+            let t = config.lookahead_time * (t_idx as f32 / config.time_samples as f32);
+
+            let predicted_self = predict_position(self_pos, candidate_heading, current_speed, t, bounds);
+            let predicted_neighbor = predict_position(neighbor.pos, neighbor.hdg, neighbor_speed, t, bounds);
+
+            let separation = bounds.distance(predicted_self.as_vec2(), predicted_neighbor.as_vec2());
+            if separation < min_separation {
+                min_separation = separation;
+            }
+        }
+    }
+
+    min_separation
+}
+
+/// Score a heading candidate balancing goal-seeking vs collision avoidance.
+///
+/// Returns the combined score (higher = better). Includes a right-turn bias
+/// for threatened situations (ICAO-style rules for deterministic avoidance).
+fn score_heading_candidate(
+    heading_offset: f32,
+    min_separation: f32,
+    desired_heading: Heading,
+    candidate_heading: Heading,
+    config: &VelocityObstacleConfig,
+) -> f32 {
+    let heading_error = (candidate_heading.radians() - desired_heading.radians()).abs();
+    let normalized_error = heading_error / std::f32::consts::PI;
+
+    let separation_score = if min_separation < config.safe_distance {
+        -1.0 + (min_separation / config.safe_distance)
+    } else {
+        (min_separation / config.safe_distance).min(2.0) / 2.0
+    };
+
+    let goal_score = 1.0 - normalized_error;
+    let mut score = goal_score * (1.0 - config.avoidance_weight)
+        + separation_score * config.avoidance_weight;
+
+    // CONSISTENT TURN DIRECTION: Use deterministic rules to avoid "reciprocal dance"
+    // Rule: ALWAYS turn RIGHT (negative heading offset) when threatened
+    // Both drones turning right means they pass each other safely (left-to-left)
+    /// Score bonus for right turns during threat (ICAO-style pass-left-to-left).
+    const RIGHT_TURN_BONUS: f32 = 0.3;
+    /// Score penalty for left turns during threat (discourages left-to-right passes).
+    const LEFT_TURN_PENALTY: f32 = -0.2;
+    /// Threat detection multiplier for safe distance.
+    const THREAT_DETECTION_MULTIPLIER: f32 = 2.0;
+    if min_separation < config.safe_distance * THREAT_DETECTION_MULTIPLIER {
+        let threat_proximity = 1.0 - (min_separation / (config.safe_distance * THREAT_DETECTION_MULTIPLIER));
+        let turn_right_bias = if heading_offset < 0.0 {
+            RIGHT_TURN_BONUS * threat_proximity
+        } else if heading_offset > 0.0 {
+            LEFT_TURN_PENALTY * threat_proximity
+        } else {
+            0.0
+        };
+        score += turn_right_bias;
+    }
+
+    score
+}
+
 /// Predict position after traveling for a given time at constant heading/speed.
 fn predict_position(
     start: Position,
     heading: Heading,
     speed: f32,
     time: f32,
-    bounds: &Bounds,
+    _bounds: &Bounds,
 ) -> Position {
     let distance = speed * time;
     let dx = heading.radians().cos() * distance;
@@ -322,16 +344,8 @@ pub fn get_recommended_heading(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::fixtures::{create_test_bounds_small, create_test_state_with_vel};
     use crate::types::Velocity;
-
-    fn create_state(x: f32, y: f32, hdg: f32, speed: f32) -> State {
-        State {
-            pos: Position::new(x, y),
-            hdg: Heading::new(hdg),
-            vel: Velocity::from_heading_and_speed(Heading::new(hdg), speed),
-            acc: crate::types::Acceleration::zero(),
-        }
-    }
 
     fn create_drone_info(uid: usize, x: f32, y: f32, hdg: f32, speed: f32) -> DroneInfo {
         DroneInfo {
@@ -339,20 +353,17 @@ mod tests {
             pos: Position::new(x, y),
             hdg: Heading::new(hdg),
             vel: Velocity::from_heading_and_speed(Heading::new(hdg), speed),
+            is_formation_leader: false,
         }
-    }
-
-    fn create_bounds() -> Bounds {
-        Bounds::new(1000.0, 1000.0).unwrap()
     }
 
     #[test]
     fn test_no_threat_returns_zero_adjustment() {
-        let bounds = create_bounds();
+        let bounds = create_test_bounds_small();
         let config = VelocityObstacleConfig::default();
 
-        // Drone at center moving right
-        let state = create_state(500.0, 500.0, 0.0, 50.0);
+        // Drone at center moving right (7.5 m/s)
+        let state = create_test_state_with_vel(250.0, 250.0, 0.0, 7.5);
         let desired = Heading::new(0.0);
 
         // Empty swarm
@@ -366,20 +377,17 @@ mod tests {
 
     #[test]
     fn test_threat_detected_when_collision_imminent() {
-        let bounds = create_bounds();
+        let bounds = create_test_bounds_small();
         let config = VelocityObstacleConfig::default();
 
         // Two drones where one will catch up to the other
-        // With 0.75s lookahead:
-        // Self at 400, speed 50 -> after 0.75s at 437.5
-        // Other at 445, speed 10 -> after 0.75s at 452.5
-        // Distance = 15 < safe_distance(30)
-        let state = create_state(400.0, 500.0, 0.0, 50.0); // Moving right fast
+        // Self at 200m, speed 10 m/s; Other at 203m, speed 2 m/s (3m apart, within detection 5m)
+        let state = create_test_state_with_vel(200.0, 250.0, 0.0, 10.0); // Moving right at 10 m/s
         let desired = Heading::new(0.0);
 
         let swarm = vec![
-            create_drone_info(0, 400.0, 500.0, 0.0, 50.0), // Self
-            create_drone_info(1, 445.0, 500.0, 0.0, 10.0), // Slow drone ahead, same direction
+            create_drone_info(0, 200.0, 250.0, 0.0, 10.0), // Self
+            create_drone_info(1, 203.0, 250.0, 0.0, 2.0),  // Slow drone ahead, same direction
         ];
 
         let result = calculate_velocity_obstacle(
@@ -392,16 +400,16 @@ mod tests {
 
     #[test]
     fn test_suggests_avoidance_maneuver() {
-        let bounds = create_bounds();
+        let bounds = create_test_bounds_small();
         let config = VelocityObstacleConfig::default();
 
         // Drone heading right, obstacle directly ahead
-        let state = create_state(400.0, 500.0, 0.0, 50.0);
+        let state = create_test_state_with_vel(200.0, 250.0, 0.0, 10.0); // 10 m/s
         let desired = Heading::new(0.0);
 
         let swarm = vec![
-            create_drone_info(0, 400.0, 500.0, 0.0, 50.0),
-            create_drone_info(1, 480.0, 500.0, 0.0, 10.0), // Slow drone ahead
+            create_drone_info(0, 200.0, 250.0, 0.0, 10.0),
+            create_drone_info(1, 203.0, 250.0, 0.0, 2.0), // Slow drone 3m ahead (within detection 5m)
         ];
 
         let result = calculate_velocity_obstacle(
@@ -414,15 +422,15 @@ mod tests {
 
     #[test]
     fn test_stationary_drone_returns_default() {
-        let bounds = create_bounds();
+        let bounds = create_test_bounds_small();
         let config = VelocityObstacleConfig::default();
 
         // Stationary drone
-        let state = create_state(500.0, 500.0, 0.0, 0.0);
+        let state = create_test_state_with_vel(250.0, 250.0, 0.0, 0.0);
         let desired = Heading::new(0.0);
 
         let swarm = vec![
-            create_drone_info(1, 520.0, 500.0, 0.0, 50.0),
+            create_drone_info(1, 260.0, 250.0, 0.0, 7.5), // 10m away
         ];
 
         let result = calculate_velocity_obstacle(
@@ -435,18 +443,18 @@ mod tests {
 
     #[test]
     fn test_distant_drone_ignored() {
-        let bounds = create_bounds();
+        let bounds = create_test_bounds_small();
         let config = VelocityObstacleConfig {
-            detection_range: 100.0,
+            detection_range: 50.0, // 50 meters detection range
             ..Default::default()
         };
 
-        let state = create_state(500.0, 500.0, 0.0, 50.0);
+        let state = create_test_state_with_vel(250.0, 250.0, 0.0, 7.5);
         let desired = Heading::new(0.0);
 
-        // Drone far away (beyond detection range)
+        // Drone far away (beyond detection range - 100m away)
         let swarm = vec![
-            create_drone_info(1, 800.0, 500.0, std::f32::consts::PI, 50.0),
+            create_drone_info(1, 350.0, 250.0, std::f32::consts::PI, 7.5),
         ];
 
         let result = calculate_velocity_obstacle(

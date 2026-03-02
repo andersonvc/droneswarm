@@ -1,3 +1,4 @@
 .vscode
 wasm-lib/target
 drone-lib/target
+emsdk

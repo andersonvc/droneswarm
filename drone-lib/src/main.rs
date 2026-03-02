@@ -3,20 +3,19 @@ use std::collections::VecDeque;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use drone_lib::models::{drone::Drone, fixed_wing::FixedWing};
-use drone_lib::{Bounds, DroneInfo, Heading, Objective, ObjectiveType, Position};
+use drone_lib::{Bounds, Drone, DroneAgent, DroneInfo, Heading, Objective, Position};
 use log::info;
 
 type DroneMap = HashMap<usize, Box<dyn Drone>>;
 
 fn main() {
-    // Initialize 5 fixed-wing drones
+    // Initialize 5 drones using the modular DroneAgent architecture
     let bounds = Bounds::new(1000.0, 1000.0).expect("Invalid bounds");
     let mut drones = (0..5)
         .map(|x| {
             (
                 x,
-                Box::new(FixedWing::new(
+                Box::new(DroneAgent::new(
                     x,
                     Position::new(0.0, 0.0),
                     Heading::new(0.0),
@@ -35,11 +34,8 @@ fn main() {
     .into_iter()
     .collect();
 
-    let new_objective = Objective {
-        task: ObjectiveType::ReachWaypoint,
+    let new_objective = Objective::ReachWaypoint {
         waypoints: custom_waypoints,
-        route: None,
-        targets: None,
     };
 
     drones
