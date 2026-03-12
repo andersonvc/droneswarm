@@ -7,11 +7,13 @@
 //! - `CommandQueue` for decoupled command processing
 
 pub mod command;
+pub mod parameterized_path;
 pub mod planner;
 pub mod task;
 pub mod traits;
 
 pub use command::{AgentCommand, CommandQueue};
-pub use planner::{ApproachGateConfig, ParameterizedPath, PathPlanner};
+pub use parameterized_path::ParameterizedPath;
+pub use planner::{ApproachGateConfig, PathPlanner};
 pub use task::{Task, WaypointMission};
 pub use traits::{Mission, MissionStatus};

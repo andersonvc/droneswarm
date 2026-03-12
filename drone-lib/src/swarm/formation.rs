@@ -134,6 +134,10 @@ pub mod defaults {
 
     /// Angle tolerance for rear approach (radians).
     pub const APPROACH_ANGLE_TOLERANCE: f32 = 1.3;
+
+    /// Leader speed cap (fraction of max speed).
+    /// Leaders fly slower so followers can catch up and maintain formation.
+    pub const LEADER_SPEED_CAP: f32 = 0.65;
 }
 
 /// Formation types with spacing parameters.

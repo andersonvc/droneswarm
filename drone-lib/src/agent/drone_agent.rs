@@ -5,13 +5,14 @@ use std::sync::Arc;
 
 use crate::behaviors::tree::node::{BehaviorContext, BehaviorNode};
 use crate::behaviors::{
-    create_orca_bt, ORCAConfig, SeparationConfig,
+    create_orca_bt_with_apf, APFConfig, ORCAConfig, SeparationConfig,
 };
 use crate::messages::{FormationCommand, FormationSlot, VelocityConsensus};
 use crate::missions::{CommandQueue, Mission, Task, WaypointMission};
 use super::formation_navigator::FormationNavigator;
 use super::traits::Drone;
 use crate::platform::{GenericPlatform, Platform};
+use crate::swarm::formation::defaults as formation_defaults;
 use crate::types::{
     units, Bounds, DroneInfo, DronePerfFeatures, Heading, Objective, Position, State, Vec2,
 };
@@ -56,8 +57,14 @@ pub struct DroneAgent {
     sep_config: SeparationConfig,
     /// Distance threshold for waypoint arrival.
     waypoint_clearance: f32,
+    /// APF collision avoidance configuration.
+    apf_config: Option<APFConfig>,
     /// Formation navigation state.
     formation: FormationNavigator,
+    /// Group identifier for friend/foe distinction.
+    group: u32,
+    /// Urgency from previous tick — used to suppress waypoint seeking during evasion.
+    last_urgency: f32,
 }
 
 impl DroneAgent {
@@ -70,12 +77,15 @@ impl DroneAgent {
             id,
             platform: GenericPlatform::new(pos, hdg, bounds),
             mission: WaypointMission::new(bounds),
-            behavior_tree: create_orca_bt(orca_config, sep_config),
+            behavior_tree: create_orca_bt_with_apf(orca_config, sep_config, None),
             command_queue: CommandQueue::new(),
             orca_config,
             sep_config,
+            apf_config: None,
             waypoint_clearance: DEFAULT_WAYPOINT_CLEARANCE,
             formation: FormationNavigator::new(),
+            group: 0,
+            last_urgency: 0.0,
         }
     }
 
@@ -91,7 +101,9 @@ impl DroneAgent {
 
     /// Get shareable drone info for swarm communication.
     pub fn get_info(&self) -> DroneInfo {
-        DroneInfo::new_with_leader(self.id, self.platform.state(), self.formation.is_leader())
+        let mut info = DroneInfo::new_with_leader(self.id, self.platform.state(), self.formation.is_leader());
+        info.group = self.group;
+        info
     }
 
     /// Get the drone's current target waypoint (if any).
@@ -118,6 +130,28 @@ impl DroneAgent {
 
         // 3. Get desired heading from mission
         let mut desired_heading = self.mission.get_desired_heading(self.platform.state());
+
+        // 3a. Suppress mission heading when urgency is high from previous tick.
+        // Without this, SeekWaypoint points the drone straight at the enemy every tick,
+        // and ORCA finds the nearest safe velocity to "toward enemy" — barely skirting
+        // the blast zone instead of truly evading. By using the current travel heading
+        // as the preferred direction, ORCA can compute a proper evasion maneuver.
+        if self.last_urgency > 0.3 && desired_heading.is_some() {
+            let current_hdg = self.platform.state().hdg;
+            if self.last_urgency > 0.7 {
+                // High urgency: fully override with current heading
+                desired_heading = Some(current_hdg);
+            } else {
+                // Medium urgency: blend between current heading and mission heading
+                let blend = (self.last_urgency - 0.3) / 0.4; // 0.0 at 0.3, 1.0 at 0.7
+                let mission_hdg = desired_heading.unwrap();
+                let delta = crate::types::normalize_angle(
+                    mission_hdg.radians() - current_hdg.radians(),
+                );
+                let blended = current_hdg.radians() + (1.0 - blend) * delta;
+                desired_heading = Some(Heading::new(blended));
+            }
+        }
 
         // 3b. Determine if this follower is in route-following mode
         let is_follower_route_mode = self.formation.in_formation()
@@ -161,13 +195,12 @@ impl DroneAgent {
         } else if is_follower_route_mode {
             // Route-following mode: base speed matches leader's speed cap,
             // modulated by the along-track formation factor.
-            const LEADER_SPEED_CAP: f32 = 0.65;
             let formation_factor = self.formation.compute_formation_speed_factor(
                 self.platform.state().pos.as_vec2(),
                 swarm,
                 self.platform.bounds(),
             ).unwrap_or(1.0);
-            ctx.desired_speed = (LEADER_SPEED_CAP * formation_factor).clamp(0.1, 1.0);
+            ctx.desired_speed = (formation_defaults::LEADER_SPEED_CAP * formation_factor).clamp(0.1, 1.0);
         } else {
             let base_speed = self.mission.get_desired_speed_factor();
             ctx.desired_speed = (base_speed * self.formation.speed_multiplier()).min(1.0);
@@ -175,6 +208,9 @@ impl DroneAgent {
 
         // 5. Tick behavior tree (applies avoidance, modifies context)
         self.behavior_tree.tick(&mut ctx);
+
+        // Save urgency for next tick's heading suppression
+        self.last_urgency = ctx.urgency;
 
         // 6. Apply steering to platform (quadcopter-style: velocity independent of heading)
         let max_speed = self.platform.perf().max_vel;
@@ -184,7 +220,7 @@ impl DroneAgent {
 
             // Formation leaders operate at 65% max speed so followers can catch up
             if self.formation.is_leader() {
-                vel = vel.clamp_speed(max_speed * 0.65);
+                vel = vel.clamp_speed(max_speed * formation_defaults::LEADER_SPEED_CAP);
             }
 
             self.platform.apply_velocity_steering(vel, ctx.desired_heading, dt);
@@ -193,7 +229,7 @@ impl DroneAgent {
 
             // Formation leaders operate at 65% max speed so followers can catch up
             if self.formation.is_leader() {
-                speed = speed.min(max_speed * 0.65);
+                speed = speed.min(max_speed * formation_defaults::LEADER_SPEED_CAP);
             }
 
             self.platform.apply_steering(heading, speed, dt);
@@ -287,8 +323,14 @@ impl DroneAgent {
     }
 
     /// Set flight parameters (wasm-lib compatibility).
+    /// Also syncs ORCA max_speed so collision avoidance operates at the correct speed regime.
     pub fn set_flight_params(&mut self, params: DronePerfFeatures) {
+        let speed_changed = (params.max_vel - self.platform.perf().max_vel).abs() > 0.01;
         self.platform.set_perf(params);
+        if speed_changed {
+            self.orca_config.max_speed = params.max_vel;
+            self.rebuild_behavior_tree();
+        }
     }
 
     /// Set waypoint clearance (wasm-lib compatibility).
@@ -299,6 +341,22 @@ impl DroneAgent {
     /// Get waypoint clearance (wasm-lib compatibility).
     pub fn waypoint_clearance(&self) -> f32 {
         self.waypoint_clearance
+    }
+
+    /// Set the drone's group for friend/foe distinction.
+    pub fn set_group(&mut self, group: u32) {
+        self.group = group;
+    }
+
+    /// Get the drone's group.
+    pub fn group(&self) -> u32 {
+        self.group
+    }
+
+    /// Set APF collision avoidance configuration.
+    pub fn set_apf_config(&mut self, config: APFConfig) {
+        self.apf_config = Some(config);
+        self.rebuild_behavior_tree();
     }
 
     /// Set ORCA collision avoidance configuration.
@@ -325,7 +383,7 @@ impl DroneAgent {
 
     /// Rebuild behavior tree with current configurations.
     fn rebuild_behavior_tree(&mut self) {
-        self.behavior_tree = create_orca_bt(self.orca_config, self.sep_config);
+        self.behavior_tree = create_orca_bt_with_apf(self.orca_config, self.sep_config, self.apf_config);
     }
 
     /// Get spline path for visualization (wasm-lib compatibility).

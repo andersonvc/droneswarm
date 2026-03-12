@@ -1,11 +1,10 @@
-use std::collections::HashSet;
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use drone_lib::DroneAgent;
 use drone_lib::{
-    Bounds as LibBounds, DroneInfo, DronePerfFeatures, FormationApproachMode, FormationCommand,
-    FormationSlot, FormationType, Heading, Objective, PathPlanner, Position, Vec2,
+    APFConfig, Bounds as LibBounds, DroneInfo, DronePerfFeatures, FormationApproachMode,
+    FormationCommand, FormationSlot, FormationType, Heading, Objective, PathPlanner, Position, Vec2,
 };
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
@@ -240,13 +239,15 @@ struct DroneState {
     color: Color,
 }
 
-/// Active formation state for the swarm.
+/// Active formation state for a group of drones.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 struct FormationState {
     formation_type: FormationType,
     leader_id: Option<usize>,
     slot_assignments: Vec<(usize, FormationSlot)>,
+    /// Which drone IDs belong to this formation group
+    drone_ids: HashSet<u32>,
     center: Position,
     heading: f32,
     /// Smoothed heading for gradual formation rotation during turns
@@ -259,8 +260,24 @@ struct FormationState {
     leader_route: Option<Arc<[Position]>>,
 }
 
+/// Drone length in meters — matches the 15px visual size at 0.4 px/m scale.
+const DRONE_LENGTH_METERS: f32 = 37.5;
+/// Detonation blast radius = 5x drone length
+const DETONATION_RADIUS: f32 = DRONE_LENGTH_METERS * 5.0;
+
 pub struct Swarm {
     drones: Vec<DroneState>,
+    /// Drone IDs queued for detonation (processed next tick)
+    pending_detonations: HashSet<u32>,
+    /// Drones in "attack target" mode: drone_id → target position (meters)
+    attack_targets: HashMap<u32, Position>,
+    /// Drones in "intercept" mode: attacker_id → target_drone_id
+    intercept_targets: HashMap<u32, u32>,
+    /// Protected positions (meters) per group: interceptors must not detonate near these.
+    /// Key = group id (0 or 1), Value = positions to protect.
+    protected_zones: HashMap<u32, Vec<Position>>,
+    /// Drone ID that splits group 0 (< split) from group 1 (>= split).
+    group_split_id: u32,
     /// Bounds in meters (for drone-lib)
     lib_bounds: LibBounds,
     /// Coordinate translation between pixels and meters
@@ -269,7 +286,7 @@ pub struct Swarm {
     speed_multiplier: f32,
     selected_ids: HashSet<u32>,
     consensus_protocol: ConsensusProtocol,
-    formation: Option<FormationState>,
+    formations: Vec<FormationState>,
 }
 
 impl Swarm {
@@ -320,32 +337,21 @@ impl Swarm {
             })
             .collect();
 
-        let mut swarm = Swarm {
+        let swarm = Swarm {
             drones,
+            pending_detonations: HashSet::new(),
+            attack_targets: HashMap::new(),
+            intercept_targets: HashMap::new(),
+            protected_zones: HashMap::new(),
+            group_split_id: 0,
             lib_bounds,
             world_scale,
             simulation_time: 0.0,
             speed_multiplier: config.speed_multiplier.unwrap_or(8.0),
             selected_ids: HashSet::new(),
             consensus_protocol: ConsensusProtocol::default(),
-            formation: None,
+            formations: Vec::new(),
         };
-
-        // Enable formation by default - Chevron formation with spacing=40px
-        // Leader (lowest ID) follows waypoints, others maintain formation
-        let default_spacing_m = swarm.world_scale.px_to_meters(40.0);
-        swarm.set_formation(FormationType::Chevron { spacing: default_spacing_m, angle: std::f32::consts::FRAC_PI_4 }, None);
-
-        // Assign default patrol route (hourglass/bowtie pattern — two crossing triangles)
-        let default_route = vec![
-            Point { x: 200.0, y: 100.0 },  // 1: top-left
-            Point { x: 550.0, y: 500.0 },  // 2: center
-            Point { x: 900.0, y:  50.0 },  // 3: top-right
-            Point { x: 850.0, y: 900.0 },  // 4: bottom-right
-            Point { x: 550.0, y: 650.0 },  // 5: center-lower
-            Point { x: 250.0, y: 850.0 },  // 6: bottom-left
-        ];
-        swarm.assign_route_all(default_route);
 
         Ok(swarm)
     }
@@ -433,9 +439,14 @@ impl Swarm {
     // ========================================================================
 
     fn generate_color(index: usize, total: usize) -> Color {
-        let hue = (index as f32 / total as f32) * 360.0;
-        let (r, g, b) = hsl_to_rgb(hue, 0.7, 0.5);
-        Color { r, g, b }
+        let half = (total + 1) / 2;
+        if index < half {
+            // Group A — red
+            Color { r: 220, g: 60, b: 60 }
+        } else {
+            // Group B — blue
+            Color { r: 60, g: 120, b: 220 }
+        }
     }
 
     // ========================================================================
@@ -493,8 +504,146 @@ impl Swarm {
             swarm_info[idx] = self.drones[idx].agent.get_info();
         }
 
-        // Collision detection - find all colliding drone pairs
+        // Process intercept drones: update waypoint to follow target drone each tick
+        if !self.intercept_targets.is_empty() {
+            // Collect target positions first (borrow checker)
+            let target_positions: HashMap<u32, Position> = self.intercept_targets.iter()
+                .filter_map(|(&attacker_id, &target_id)| {
+                    self.drones.iter()
+                        .find(|d| d.id == target_id)
+                        .map(|d| (attacker_id, d.agent.state().pos))
+                })
+                .collect();
+
+            let mut intercept_detonated: Vec<u32> = Vec::new();
+            let mut intercept_orphaned: Vec<u32> = Vec::new();
+            let mut intercept_abort: Vec<u32> = Vec::new();
+
+            for (&attacker_id, &_target_id) in &self.intercept_targets {
+                if let Some(&target_pos) = target_positions.get(&attacker_id) {
+                    // Update interceptor's waypoint to target's current position
+                    if let Some(drone) = self.drones.iter_mut().find(|d| d.id == attacker_id) {
+                        let drone_pos = drone.agent.state().pos;
+
+                        // Check if within detonation range of target
+                        let dist = self.lib_bounds.distance(
+                            drone_pos.as_vec2(),
+                            target_pos.as_vec2(),
+                        );
+                        if dist <= DETONATION_RADIUS {
+                            // Before detonating, check if blast would hit a friendly target
+                            let group = if attacker_id < self.group_split_id { 0 } else { 1 };
+                            let would_hit_friendly = self.protected_zones
+                                .get(&group)
+                                .map(|zones| {
+                                    zones.iter().any(|z| {
+                                        self.lib_bounds.distance(drone_pos.as_vec2(), z.as_vec2())
+                                            <= DETONATION_RADIUS
+                                    })
+                                })
+                                .unwrap_or(false);
+
+                            if would_hit_friendly {
+                                // Abort: don't detonate, disengage
+                                intercept_abort.push(attacker_id);
+                            } else {
+                                intercept_detonated.push(attacker_id);
+                            }
+                        } else {
+                            // Not in range yet — keep chasing
+                            let mut waypoints = VecDeque::new();
+                            waypoints.push_back(target_pos);
+                            drone.agent.set_objective(Objective::ReachWaypoint { waypoints });
+                        }
+                    }
+                } else {
+                    // Target drone no longer exists — orphaned interceptor
+                    intercept_orphaned.push(attacker_id);
+                }
+            }
+
+            for id in &intercept_detonated {
+                self.intercept_targets.remove(id);
+                self.pending_detonations.insert(*id);
+            }
+            // Orphaned interceptors: target destroyed, stop intercepting
+            for id in &intercept_orphaned {
+                self.intercept_targets.remove(id);
+                if let Some(drone) = self.drones.iter_mut().find(|d| d.id == *id) {
+                    drone.agent.set_objective(Objective::Sleep);
+                }
+            }
+            // Aborted interceptors: too close to friendly target, disengage
+            for id in &intercept_abort {
+                self.intercept_targets.remove(id);
+                if let Some(drone) = self.drones.iter_mut().find(|d| d.id == *id) {
+                    drone.agent.set_objective(Objective::Sleep);
+                }
+            }
+        }
+
+        // Check attack-mode drones: auto-detonate when within blast radius of target
+        if !self.attack_targets.is_empty() {
+            let mut arrived: Vec<u32> = Vec::new();
+            for (&drone_id, &target_pos) in &self.attack_targets {
+                if let Some(drone) = self.drones.iter().find(|d| d.id == drone_id) {
+                    let drone_pos = drone.agent.state().pos;
+                    let dist = self.lib_bounds.distance(
+                        drone_pos.as_vec2(), target_pos.as_vec2()
+                    );
+                    if dist <= DETONATION_RADIUS {
+                        arrived.push(drone_id);
+                    }
+                }
+            }
+            for id in arrived {
+                self.attack_targets.remove(&id);
+                self.pending_detonations.insert(id);
+            }
+        }
+
+        // Clean up attack/intercept targets for drones that no longer exist
+        self.attack_targets.retain(|id, _| self.drones.iter().any(|d| d.id == *id));
+        self.intercept_targets.retain(|id, _| self.drones.iter().any(|d| d.id == *id));
+
+        // Process detonations — the detonating drone and everything in blast radius
         let mut destroyed_ids: HashSet<u32> = HashSet::new();
+
+        if !self.pending_detonations.is_empty() {
+            let detonations: Vec<u32> = self.pending_detonations.drain().collect();
+            for det_id in &detonations {
+                // Find the detonating drone's position
+                let det_pos = self.drones.iter()
+                    .find(|d| d.id == *det_id)
+                    .map(|d| d.agent.state().pos);
+
+                let Some(det_pos) = det_pos else { continue };
+
+                // The detonating drone is always destroyed
+                destroyed_ids.insert(*det_id);
+
+                web_sys::console::info_1(
+                    &format!("DETONATION - Drone {} at ({:.0}, {:.0}), blast radius {:.1}m",
+                        det_id, det_pos.x(), det_pos.y(), DETONATION_RADIUS).into(),
+                );
+
+                // Destroy all drones within blast radius
+                for drone in &self.drones {
+                    if drone.id == *det_id { continue; }
+                    let dist = self.lib_bounds.distance(
+                        det_pos.as_vec2(), drone.agent.state().pos.as_vec2()
+                    );
+                    if dist <= DETONATION_RADIUS {
+                        destroyed_ids.insert(drone.id);
+                        web_sys::console::info_1(
+                            &format!("  blast killed Drone {} (dist {:.1}m)", drone.id, dist).into(),
+                        );
+                    }
+                }
+            }
+        }
+
+        // Collision detection - find all colliding drone pairs
 
         for i in 0..self.drones.len() {
             for j in (i + 1)..self.drones.len() {
@@ -521,14 +670,18 @@ impl Swarm {
 
         // Remove destroyed drones
         if !destroyed_ids.is_empty() {
-            // Before removing, save leader's route if leader is being destroyed
-            let leader_route = self.save_leader_route_if_destroyed(&destroyed_ids);
+            // Before removing, save leader routes if leaders are being destroyed
+            let saved_routes = self.save_leader_routes_if_destroyed(&destroyed_ids);
 
             self.drones.retain(|d| !destroyed_ids.contains(&d.id));
             // Also remove from selection
             self.selected_ids.retain(|id| !destroyed_ids.contains(id));
-            // Check if leader was destroyed - promote successor if needed
-            self.check_leader_succession_with_route(leader_route);
+            // Remove destroyed drone IDs from formation groups
+            for formation in &mut self.formations {
+                formation.drone_ids.retain(|id| !destroyed_ids.contains(id));
+            }
+            // Check if any leaders were destroyed - promote successors if needed
+            self.check_leader_successions(saved_routes);
         }
 
         self.simulation_time += effective_dt;
@@ -546,8 +699,8 @@ impl Swarm {
                 let objective = d.agent.objective();
 
                 // Hide all waypoint/path visualization for formation followers
-                let is_follower = self.formation.as_ref()
-                    .is_some_and(|f| f.leader_id != Some(d.id as usize));
+                let is_follower = self.formations.iter()
+                    .any(|f| f.drone_ids.contains(&d.id) && f.leader_id != Some(d.id as usize));
 
                 let spline_path: Vec<Point> = if is_follower {
                     Vec::new()
@@ -640,6 +793,246 @@ impl Swarm {
             speed_multiplier: self.speed_multiplier,
             is_valid: true,
         }
+    }
+
+    /// Queue a drone for detonation. The drone and anything within
+    /// DETONATION_RADIUS (3x drone length) will be destroyed next tick.
+    pub fn detonate_drone(&mut self, drone_id: u32) {
+        // Verify drone exists
+        if self.drones.iter().any(|d| d.id == drone_id) {
+            self.pending_detonations.insert(drone_id);
+        }
+    }
+
+    /// Detonate selected drones.
+    pub fn detonate_selected(&mut self) {
+        let selected: Vec<u32> = self.selected_ids.iter().copied().collect();
+        for id in selected {
+            self.detonate_drone(id);
+        }
+    }
+
+    /// Remove a drone from its formation, promoting a new leader if it was the leader.
+    fn remove_drone_from_formation(&mut self, drone_id: u32) {
+        // Find which formation this drone belongs to
+        let formation_idx = self.formations.iter().position(|f| f.drone_ids.contains(&drone_id));
+        let Some(idx) = formation_idx else { return };
+
+        let was_leader = self.formations[idx].leader_id == Some(drone_id as usize);
+
+        // Remove from formation and clear agent state
+        self.formations[idx].drone_ids.remove(&drone_id);
+        if let Some(drone) = self.drones.iter_mut().find(|d| d.id == drone_id) {
+            drone.agent.clear_formation_slot();
+            drone.agent.set_formation_leader(false);
+        }
+
+        if !was_leader {
+            return;
+        }
+
+        // Leader was pulled out — promote a successor
+        let remaining_ids: HashSet<u32> = self.formations[idx].drone_ids.iter()
+            .copied()
+            .filter(|id| self.drones.iter().any(|d| d.id == *id))
+            .collect();
+
+        if remaining_ids.is_empty() {
+            self.formations.remove(idx);
+            return;
+        }
+
+        // Save the formation state before removing it
+        let formation_type = self.formations[idx].formation_type;
+        let route = self.formations[idx].leader_route.clone();
+        let was_route_mode = self.formations[idx].route_mode;
+        self.formations.remove(idx);
+
+        // Re-create formation with new leader (lowest ID)
+        let new_leader = remaining_ids.iter().map(|&id| id as usize).min();
+        self.set_formation_for_group(formation_type, remaining_ids, new_leader);
+
+        // Restore route to new leader
+        if let Some(route) = route {
+            if let Some(formation) = self.formations.last_mut() {
+                formation.leader_route = Some(route.clone());
+                formation.route_mode = was_route_mode;
+
+                if let Some(leader_id) = formation.leader_id {
+                    if let Some(leader_drone) = self.drones.iter_mut().find(|d| d.id == leader_id as u32) {
+                        let deque: VecDeque<Position> = route.iter().copied().collect();
+                        leader_drone.agent.set_objective(Objective::FollowRoute {
+                            waypoints: deque,
+                            route,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    /// Assign a drone to attack a target position (in pixels).
+    /// The drone navigates to the target and auto-detonates when within blast radius.
+    pub fn attack_target(&mut self, drone_id: u32, target_x: f32, target_y: f32) {
+        let target_m = Position::new(
+            self.world_scale.px_to_meters(target_x),
+            self.world_scale.px_to_meters(target_y),
+        );
+
+        // Remove from formation (promotes new leader if needed)
+        self.remove_drone_from_formation(drone_id);
+
+        // Set drone to navigate to the target
+        if let Some(drone) = self.drones.iter_mut().find(|d| d.id == drone_id) {
+            let mut waypoints = VecDeque::new();
+            waypoints.push_back(target_m);
+            drone.agent.set_objective(Objective::ReachWaypoint { waypoints });
+        }
+
+        // Register for auto-detonation check
+        self.attack_targets.insert(drone_id, target_m);
+    }
+
+    /// Assign a drone to intercept (chase) an enemy drone.
+    /// The interceptor updates its waypoint each tick to follow the target drone
+    /// and auto-detonates when within blast radius.
+    pub fn intercept_drone(&mut self, attacker_id: u32, target_drone_id: u32) {
+        // Don't intercept self
+        if attacker_id == target_drone_id { return; }
+        // Verify both drones exist
+        if !self.drones.iter().any(|d| d.id == attacker_id) { return; }
+        if !self.drones.iter().any(|d| d.id == target_drone_id) { return; }
+
+        // Remove from formation (promotes new leader if needed)
+        self.remove_drone_from_formation(attacker_id);
+
+        // Set initial waypoint to target drone's current position
+        if let Some(target_pos) = self.drones.iter()
+            .find(|d| d.id == target_drone_id)
+            .map(|d| d.agent.state().pos)
+        {
+            if let Some(drone) = self.drones.iter_mut().find(|d| d.id == attacker_id) {
+                let mut waypoints = VecDeque::new();
+                waypoints.push_back(target_pos);
+                drone.agent.set_objective(Objective::ReachWaypoint { waypoints });
+            }
+        }
+
+        // Remove from attack_targets if it was there
+        self.attack_targets.remove(&attacker_id);
+        // Register for intercept tracking
+        self.intercept_targets.insert(attacker_id, target_drone_id);
+    }
+
+    /// Return a drone to its original formation group.
+    /// Re-adds it to the formation's drone_ids, recomputes slots, and clears
+    /// any attack/intercept assignments.
+    pub fn return_to_formation(&mut self, drone_id: u32, group_start: u32, group_end: u32) {
+        if !self.drones.iter().any(|d| d.id == drone_id) { return; }
+
+        // Clear from attack/intercept tracking
+        self.attack_targets.remove(&drone_id);
+        self.intercept_targets.remove(&drone_id);
+
+        // Find the formation for this group range
+        let formation_idx = self.formations.iter().position(|f| {
+            // Match formation by checking if it contains any drone in the group range
+            f.drone_ids.iter().any(|&id| id >= group_start && id < group_end)
+                || (drone_id >= group_start && drone_id < group_end)
+        });
+
+        let Some(idx) = formation_idx else {
+            // No formation found, just set drone to sleep
+            if let Some(drone) = self.drones.iter_mut().find(|d| d.id == drone_id) {
+                drone.agent.set_objective(Objective::Sleep);
+            }
+            return;
+        };
+
+        // Re-add drone to formation group
+        self.formations[idx].drone_ids.insert(drone_id);
+
+        // Recompute all slot assignments for this formation
+        let formation = &self.formations[idx];
+        let leader_id = formation.leader_id;
+        let formation_type = formation.formation_type.clone();
+        let center = formation.center;
+        let heading = formation.heading;
+
+        // Build ordered drone list (leader first)
+        let mut drone_ids: Vec<usize> = self.drones.iter()
+            .filter(|d| self.formations[idx].drone_ids.contains(&d.id))
+            .map(|d| d.id as usize)
+            .collect();
+        if let Some(lid) = leader_id {
+            if let Some(pos) = drone_ids.iter().position(|&id| id == lid) {
+                drone_ids.remove(pos);
+                drone_ids.insert(0, lid);
+            }
+        } else {
+            drone_ids.sort();
+        }
+
+        let slots = formation_type.compute_slots(drone_ids.len());
+        let slot_assignments: Vec<(usize, FormationSlot)> = drone_ids
+            .into_iter()
+            .zip(slots)
+            .collect();
+
+        // Apply the returning drone's slot (don't disturb others)
+        for (did, slot) in &slot_assignments {
+            if *did == drone_id as usize && Some(*did) != leader_id {
+                if let Some(drone) = self.drones.iter_mut().find(|d| d.id == drone_id) {
+                    drone.agent.set_formation_slot(*slot, center, heading);
+                }
+            }
+        }
+
+        self.formations[idx].slot_assignments = slot_assignments;
+    }
+
+    /// Set the drone ID that splits group 0 from group 1.
+    /// Also assigns group IDs to all drone agents and configures
+    /// ORCA and APF enemy avoidance parameters.
+    ///
+    /// Two-layer avoidance:
+    /// - ORCA: hard avoidance at blast radius (the real danger zone).
+    ///   Long time horizon forecasts collision courses well in advance.
+    /// - APF: soft repulsive field at 10x blast radius.
+    ///   Gently pushes drones away from enemies at long range.
+    pub fn set_group_split(&mut self, split_id: u32) {
+        self.group_split_id = split_id;
+        // ORCA: avoid the actual blast zone, forecast far ahead
+        let enemy_orca_radius = DETONATION_RADIUS;
+        // APF: soft repulsion at 10x blast radius
+        let enemy_apf_distance = DETONATION_RADIUS * 10.0;
+        for drone in &mut self.drones {
+            let group = if drone.id < split_id { 0 } else { 1 };
+            drone.agent.set_group(group);
+
+            let mut orca_config = *drone.agent.orca_config();
+            orca_config.enemy_avoidance_radius = enemy_orca_radius;
+            drone.agent.set_orca_config(orca_config);
+
+            drone.agent.set_apf_config(APFConfig {
+                influence_distance: 150.0,
+                repulsion_strength: 10000000.0,
+                min_distance: 35.0,
+                max_force: 80.0,
+                enemy_influence_distance: enemy_apf_distance,
+            });
+        }
+    }
+
+    /// Set the protected positions for a group. Interceptors belonging to this
+    /// group will not auto-detonate if their blast would reach any of these positions.
+    /// Positions are in pixels and converted to meters internally.
+    pub fn set_protected_zones(&mut self, group: u32, positions_px: Vec<Point>) {
+        let positions: Vec<Position> = positions_px
+            .iter()
+            .map(|p| self.world_scale.point_px_to_position(*p))
+            .collect();
+        self.protected_zones.insert(group, positions);
     }
 
     pub fn get_drone_at(&self, x: f32, y: f32, hit_radius: f32) -> Option<u32> {
@@ -742,52 +1135,47 @@ impl Swarm {
             .collect();
         let route: Arc<[Position]> = Arc::from(waypoint_vec);
 
-        // If in formation mode, only the leader gets the route.
-        // Followers stay in position-tracking mode — they dynamically track their
-        // formation slot positions around the moving leader each tick.
-        if let Some(ref mut formation) = self.formation {
-            // Store the leader route for recomputation on succession
-            formation.leader_route = Some(route.clone());
+        // If formations exist, assign the route to each formation's leader.
+        // Followers stay in position-tracking mode.
+        if !self.formations.is_empty() {
+            for formation in &mut self.formations {
+                formation.leader_route = Some(route.clone());
 
-            // Find the leader's nearest waypoint so it joins the route at the closest point
-            let leader_nearest_idx = if let Some(leader_id) = formation.leader_id {
-                self.drones.iter()
-                    .find(|d| d.id == leader_id as u32)
-                    .map(|d| {
-                        let leader_pos = d.agent.get_info().pos;
-                        route.iter().enumerate()
-                            .min_by(|(_, a), (_, b)| {
-                                let da = self.lib_bounds.distance(leader_pos.as_vec2(), a.as_vec2());
-                                let db = self.lib_bounds.distance(leader_pos.as_vec2(), b.as_vec2());
-                                da.partial_cmp(&db).unwrap()
-                            })
-                            .map(|(i, _)| i)
-                            .unwrap_or(0)
-                    })
-                    .unwrap_or(0)
-            } else {
-                0
-            };
+                let leader_nearest_idx = if let Some(leader_id) = formation.leader_id {
+                    self.drones.iter()
+                        .find(|d| d.id == leader_id as u32)
+                        .map(|d| {
+                            let leader_pos = d.agent.get_info().pos;
+                            route.iter().enumerate()
+                                .min_by(|(_, a), (_, b)| {
+                                    let da = self.lib_bounds.distance(leader_pos.as_vec2(), a.as_vec2());
+                                    let db = self.lib_bounds.distance(leader_pos.as_vec2(), b.as_vec2());
+                                    da.partial_cmp(&db).unwrap()
+                                })
+                                .map(|(i, _)| i)
+                                .unwrap_or(0)
+                        })
+                        .unwrap_or(0)
+                } else {
+                    0
+                };
 
-            // Leader gets the original route, starting from nearest waypoint
-            if let Some(leader_id) = formation.leader_id {
-                if let Some(leader_drone) = self.drones.iter_mut().find(|d| d.id == leader_id as u32) {
-                    let mut leader_deque: VecDeque<Position> = VecDeque::with_capacity(route.len());
-                    for i in 0..route.len() {
-                        leader_deque.push_back(route[(leader_nearest_idx + i) % route.len()]);
+                if let Some(leader_id) = formation.leader_id {
+                    if let Some(leader_drone) = self.drones.iter_mut().find(|d| d.id == leader_id as u32) {
+                        let mut leader_deque: VecDeque<Position> = VecDeque::with_capacity(route.len());
+                        for i in 0..route.len() {
+                            leader_deque.push_back(route[(leader_nearest_idx + i) % route.len()]);
+                        }
+                        leader_drone.agent.set_objective(Objective::FollowRoute {
+                            waypoints: leader_deque,
+                            route: route.clone(),
+                        });
                     }
-
-                    leader_drone.agent.set_objective(Objective::FollowRoute {
-                        waypoints: leader_deque,
-                        route: route.clone(),
-                    });
                 }
-            }
 
-            // Followers do NOT get their own routes — they track formation slots
-            // around the leader via update_formation_reference() each tick.
-            formation.route_mode = false;
-            formation.leader_target = None;
+                formation.route_mode = false;
+                formation.leader_target = None;
+            }
             return;
         }
 
@@ -812,6 +1200,84 @@ impl Swarm {
                 waypoints: deque,
                 route: route.clone(),
             });
+        }
+    }
+
+    /// Assign a route to a subset of drones by ID range [start_id, end_id).
+    /// If these drones have a formation, only the leader gets the route.
+    pub fn assign_route_range(&mut self, waypoints: Vec<Point>, start_id: u32, end_id: u32) {
+        let waypoint_vec: Vec<Position> = waypoints
+            .iter()
+            .map(|p| self.world_scale.point_px_to_position(*p))
+            .collect();
+        let route: Arc<[Position]> = Arc::from(waypoint_vec);
+
+        // Check if this range has an associated formation
+        let formation_idx = self.formations.iter().position(|f| {
+            f.drone_ids.iter().any(|id| *id >= start_id && *id < end_id)
+        });
+
+        if let Some(idx) = formation_idx {
+            let formation = &mut self.formations[idx];
+            formation.leader_route = Some(route.clone());
+
+            if let Some(leader_id) = formation.leader_id {
+                let leader_nearest_idx = self.drones.iter()
+                    .find(|d| d.id == leader_id as u32)
+                    .map(|d| {
+                        let leader_pos = d.agent.get_info().pos;
+                        route.iter().enumerate()
+                            .min_by(|(_, a), (_, b)| {
+                                let da = self.lib_bounds.distance(leader_pos.as_vec2(), a.as_vec2());
+                                let db = self.lib_bounds.distance(leader_pos.as_vec2(), b.as_vec2());
+                                da.partial_cmp(&db).unwrap()
+                            })
+                            .map(|(i, _)| i)
+                            .unwrap_or(0)
+                    })
+                    .unwrap_or(0);
+
+                if let Some(leader_drone) = self.drones.iter_mut().find(|d| d.id == leader_id as u32) {
+                    let mut leader_deque: VecDeque<Position> = VecDeque::with_capacity(route.len());
+                    for i in 0..route.len() {
+                        leader_deque.push_back(route[(leader_nearest_idx + i) % route.len()]);
+                    }
+                    leader_drone.agent.set_objective(Objective::FollowRoute {
+                        waypoints: leader_deque,
+                        route: route.clone(),
+                    });
+                }
+            }
+
+            let formation = &mut self.formations[idx];
+            formation.route_mode = false;
+            formation.leader_target = None;
+            return;
+        }
+
+        // No formation - all drones in range follow the route directly
+        for drone in &mut self.drones {
+            if drone.id >= start_id && drone.id < end_id {
+                let drone_pos = drone.agent.get_info().pos;
+                let nearest_idx = route.iter().enumerate()
+                    .min_by(|(_, a), (_, b)| {
+                        let da = self.lib_bounds.distance(drone_pos.as_vec2(), a.as_vec2());
+                        let db = self.lib_bounds.distance(drone_pos.as_vec2(), b.as_vec2());
+                        da.partial_cmp(&db).unwrap()
+                    })
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
+
+                let mut deque: VecDeque<Position> = VecDeque::with_capacity(route.len());
+                for i in 0..route.len() {
+                    deque.push_back(route[(nearest_idx + i) % route.len()]);
+                }
+
+                drone.agent.set_objective(Objective::FollowRoute {
+                    waypoints: deque,
+                    route: route.clone(),
+                });
+            }
         }
     }
 
@@ -870,24 +1336,42 @@ impl Swarm {
     // Formation Control
     // ========================================================================
 
+    /// Set formation for all drones (legacy API - clears all existing formations).
     pub fn set_formation(
         &mut self,
         formation_type: FormationType,
         leader_id: Option<usize>,
     ) {
-        if self.drones.is_empty() {
+        self.clear_formation();
+        let all_ids: HashSet<u32> = self.drones.iter().map(|d| d.id).collect();
+        self.set_formation_for_group(formation_type, all_ids, leader_id);
+    }
+
+    /// Set formation for a specific group of drones identified by their IDs.
+    pub fn set_formation_for_group(
+        &mut self,
+        formation_type: FormationType,
+        group_ids: HashSet<u32>,
+        leader_id: Option<usize>,
+    ) {
+        if group_ids.is_empty() {
             return;
         }
 
-        // Clear any existing formation state first
+        // Clear formation state for drones in this group
         for drone in &mut self.drones {
-            drone.agent.set_formation_leader(false);
-            drone.agent.clear_formation_slot();
+            if group_ids.contains(&drone.id) {
+                drone.agent.set_formation_leader(false);
+                drone.agent.clear_formation_slot();
+            }
         }
 
-        // Determine leader
+        // Remove any existing formation that overlaps with this group
+        self.formations.retain(|f| f.drone_ids.is_disjoint(&group_ids));
+
+        // Determine leader (lowest ID in group if not specified)
         let resolved_leader = leader_id.or_else(|| {
-            self.drones.iter().map(|d| d.id as usize).min()
+            group_ids.iter().map(|&id| id as usize).min()
         });
 
         // Get center and heading from leader
@@ -901,8 +1385,11 @@ impl Swarm {
             (self.calculate_centroid(), 0.0)
         };
 
-        // Get drone IDs, with leader first
-        let mut drone_ids: Vec<usize> = self.drones.iter().map(|d| d.id as usize).collect();
+        // Get drone IDs in this group, with leader first
+        let mut drone_ids: Vec<usize> = self.drones.iter()
+            .filter(|d| group_ids.contains(&d.id))
+            .map(|d| d.id as usize)
+            .collect();
         if let Some(lid) = resolved_leader {
             if let Some(pos) = drone_ids.iter().position(|&id| id == lid) {
                 drone_ids.remove(pos);
@@ -930,7 +1417,6 @@ impl Swarm {
 
         // Apply slots to drones (skip leader - it follows its waypoint)
         for (drone_id, slot) in &slot_assignments {
-            // Skip the leader - it keeps its current waypoint/mission
             if Some(*drone_id) == resolved_leader {
                 continue;
             }
@@ -939,10 +1425,11 @@ impl Swarm {
             }
         }
 
-        self.formation = Some(FormationState {
+        self.formations.push(FormationState {
             formation_type,
             leader_id: resolved_leader,
             slot_assignments,
+            drone_ids: group_ids,
             center,
             heading,
             smoothed_heading: heading,
@@ -957,105 +1444,131 @@ impl Swarm {
             drone.agent.clear_formation_slot();
             drone.agent.set_formation_leader(false);
         }
-        self.formation = None;
+        self.formations.clear();
     }
 
-    /// Save the leader's route before the leader is destroyed.
-    ///
-    /// Returns the route if the current leader is in the destroyed set and has a FollowRoute objective.
-    fn save_leader_route_if_destroyed(&self, destroyed_ids: &HashSet<u32>) -> Option<Arc<[Position]>> {
-        let state = self.formation.as_ref()?;
-        let leader_id = state.leader_id?;
-
-        // Check if leader is being destroyed
-        if !destroyed_ids.contains(&(leader_id as u32)) {
-            return None;
-        }
-
-        // Find the leader and get their route
-        self.drones
-            .iter()
-            .find(|d| d.id == leader_id as u32)
-            .and_then(|d| {
-                match d.agent.objective() {
+    /// Save leader routes before leaders are destroyed.
+    /// Returns a vec of (formation_index, route) for destroyed leaders.
+    fn save_leader_routes_if_destroyed(&self, destroyed_ids: &HashSet<u32>) -> Vec<(usize, Arc<[Position]>)> {
+        let mut saved = Vec::new();
+        for (idx, state) in self.formations.iter().enumerate() {
+            let Some(leader_id) = state.leader_id else { continue };
+            if !destroyed_ids.contains(&(leader_id as u32)) {
+                continue;
+            }
+            if let Some(route) = self.drones
+                .iter()
+                .find(|d| d.id == leader_id as u32)
+                .and_then(|d| match d.agent.objective() {
                     Objective::FollowRoute { route, .. } => Some(route),
                     _ => None,
-                }
-            })
+                })
+            {
+                saved.push((idx, route));
+            }
+        }
+        saved
     }
 
-    /// Check if the current leader is still alive; if not, promote successor.
-    ///
-    /// When the leader crashes, the drone with the next lowest ID becomes
-    /// the new leader and formation slots are reassigned. If the old leader
-    /// had a route, it's transferred to the new leader.
-    fn check_leader_succession_with_route(&mut self, leader_route: Option<Arc<[Position]>>) {
-        let Some(ref state) = self.formation else { return };
+    /// Check all formations for leader succession after drone destruction.
+    fn check_leader_successions(&mut self, saved_routes: Vec<(usize, Arc<[Position]>)>) {
+        // Collect formation info that needs succession
+        let mut successions: Vec<(FormationType, HashSet<u32>, Option<Arc<[Position]>>, bool)> = Vec::new();
 
-        let current_leader = state.leader_id;
-        let formation_type = state.formation_type;
-        let saved_leader_route = state.leader_route.clone();
-        let was_route_mode = state.route_mode;
+        let mut to_remove = Vec::new();
+        for (idx, state) in self.formations.iter().enumerate() {
+            let current_leader = state.leader_id;
+            let leader_alive = current_leader
+                .map(|lid| self.drones.iter().any(|d| d.id == lid as u32))
+                .unwrap_or(false);
 
-        // Check if current leader still exists
-        let leader_alive = current_leader
-            .map(|lid| self.drones.iter().any(|d| d.id == lid as u32))
-            .unwrap_or(false);
+            if leader_alive {
+                continue;
+            }
 
-        if leader_alive {
-            return; // Leader is fine, no succession needed
+            // Check if any drones in this group are still alive
+            let remaining_ids: HashSet<u32> = state.drone_ids.iter()
+                .copied()
+                .filter(|id| self.drones.iter().any(|d| d.id == *id))
+                .collect();
+
+            if remaining_ids.is_empty() {
+                to_remove.push(idx);
+                continue;
+            }
+
+            let route = saved_routes.iter()
+                .find(|(i, _)| *i == idx)
+                .map(|(_, r)| r.clone())
+                .or_else(|| state.leader_route.clone());
+
+            successions.push((state.formation_type, remaining_ids, route, state.route_mode));
+            to_remove.push(idx);
         }
 
-        // Leader is gone - find the new leader (lowest ID among remaining drones)
-        let new_leader_id = self.drones.iter().map(|d| d.id as usize).min();
-
-        if new_leader_id.is_none() {
-            // No drones left
-            self.formation = None;
-            return;
+        // Remove old formations (in reverse order to preserve indices)
+        for idx in to_remove.into_iter().rev() {
+            self.formations.remove(idx);
         }
 
-        // Reassign formation with new leader
-        self.set_formation(formation_type, new_leader_id);
+        // Re-create formations with new leaders
+        for (formation_type, group_ids, route, was_route_mode) in successions {
+            let new_leader = group_ids.iter().map(|&id| id as usize).min();
+            self.set_formation_for_group(formation_type, group_ids, new_leader);
 
-        // Transfer route to new leader if the old leader had one
-        let route = leader_route.or(saved_leader_route);
-        if let Some(route) = route {
-            // Use assign_route_all to recompute offset routes for all drones
-            let waypoints_px: Vec<Point> = route.iter().map(|p| {
-                self.world_scale.position_to_point_px(*p)
-            }).collect();
-            self.assign_route_all(waypoints_px);
+            if let Some(route) = route {
+                let waypoints_px: Vec<Point> = route.iter().map(|p| {
+                    self.world_scale.position_to_point_px(*p)
+                }).collect();
 
-            if let Some(ref mut formation) = self.formation {
-                formation.route_mode = was_route_mode;
+                // Find the formation we just created and assign route to its leader
+                if let Some(formation) = self.formations.last_mut() {
+                    formation.leader_route = Some(Arc::from(
+                        waypoints_px.iter()
+                            .map(|p| self.world_scale.point_px_to_position(*p))
+                            .collect::<Vec<_>>()
+                    ));
+                    formation.route_mode = was_route_mode;
+
+                    if let Some(leader_id) = formation.leader_id {
+                        let route_m: Vec<Position> = waypoints_px.iter()
+                            .map(|p| self.world_scale.point_px_to_position(*p))
+                            .collect();
+                        let route_arc: Arc<[Position]> = Arc::from(route_m);
+
+                        if let Some(leader_drone) = self.drones.iter_mut().find(|d| d.id == leader_id as u32) {
+                            let deque: VecDeque<Position> = route_arc.iter().copied().collect();
+                            leader_drone.agent.set_objective(Objective::FollowRoute {
+                                waypoints: deque,
+                                route: route_arc,
+                            });
+                        }
+                    }
+                }
             }
         }
     }
 
     pub fn formation_command(&mut self, cmd: FormationCommand) {
-        let Some(ref state) = self.formation else { return };
-
-        // Extract values we need before potentially modifying self
-        let formation_type = state.formation_type;
-        let leader_id = state.leader_id;
+        if self.formations.is_empty() { return };
 
         match cmd {
             FormationCommand::Disperse => {
                 for drone in &mut self.drones {
                     drone.agent.handle_formation_command(cmd);
                 }
-                self.formation = None;
+                self.formations.clear();
             }
-            FormationCommand::Contract => {
-                // Reduce spacing by 20%
-                let new_type = Self::scale_formation_type(&formation_type, 0.8);
-                self.set_formation(new_type, leader_id);
-            }
-            FormationCommand::Expand => {
-                // Increase spacing by 20%
-                let new_type = Self::scale_formation_type(&formation_type, 1.2);
-                self.set_formation(new_type, leader_id);
+            FormationCommand::Contract | FormationCommand::Expand => {
+                let scale = if matches!(cmd, FormationCommand::Contract) { 0.8 } else { 1.2 };
+                // Collect formation info, then recreate
+                let infos: Vec<_> = self.formations.iter()
+                    .map(|f| (Self::scale_formation_type(&f.formation_type, scale), f.drone_ids.clone(), f.leader_id))
+                    .collect();
+                self.formations.clear();
+                for (new_type, group_ids, leader_id) in infos {
+                    self.set_formation_for_group(new_type, group_ids, leader_id);
+                }
             }
             FormationCommand::Hold | FormationCommand::Advance => {
                 for drone in &mut self.drones {
@@ -1066,67 +1579,63 @@ impl Swarm {
     }
 
     pub fn update_formation(&mut self, _dt: f32) {
-        let Some(ref mut state) = self.formation else { return };
+        for state in &mut self.formations {
+            let Some(lid) = state.leader_id else { continue };
 
-        // Get leader info
-        let leader_id = state.leader_id;
-        let Some(lid) = leader_id else { return };
-
-        let (leader_pos, leader_heading, leader_velocity) = {
-            if let Some(leader) = self.drones.iter().find(|d| d.id == lid as u32) {
-                let pos = leader.agent.state().pos;
-                let hdg = leader.agent.state().hdg.radians();
-                let vel = leader.agent.state().vel.as_vec2();
-                (pos, hdg, vel)
-            } else {
-                return;
-            }
-        };
-
-        state.center = leader_pos;
-
-        // Use leader's heading directly for formation orientation
-        let target_heading = leader_heading;
-        state.heading = target_heading;
-
-        // Smooth the formation heading to prevent jerky turns
-        const HEADING_SMOOTHING: f32 = 0.08;
-
-        let mut heading_diff = target_heading - state.smoothed_heading;
-        while heading_diff > std::f32::consts::PI {
-            heading_diff -= std::f32::consts::TAU;
-        }
-        while heading_diff < -std::f32::consts::PI {
-            heading_diff += std::f32::consts::TAU;
-        }
-
-        state.smoothed_heading += heading_diff * HEADING_SMOOTHING;
-        while state.smoothed_heading > std::f32::consts::PI {
-            state.smoothed_heading -= std::f32::consts::TAU;
-        }
-        while state.smoothed_heading < -std::f32::consts::PI {
-            state.smoothed_heading += std::f32::consts::TAU;
-        }
-
-        let smoothed_heading = state.smoothed_heading;
-        let is_route_mode = state.route_mode;
-        for drone in &mut self.drones {
-            if leader_id == Some(drone.id as usize) {
-                continue;
-            }
-            if drone.agent.in_formation() {
-                if is_route_mode {
-                    // In route mode, followers independently follow their own offset routes.
-                    // Only update center/heading/velocity for reference (used by speed factor),
-                    // but do NOT overwrite their mission waypoints.
-                    drone.agent.update_formation_reference_no_waypoint(
-                        state.center, smoothed_heading, leader_velocity,
-                    );
+            let (leader_pos, leader_heading, leader_velocity) = {
+                if let Some(leader) = self.drones.iter().find(|d| d.id == lid as u32) {
+                    let pos = leader.agent.state().pos;
+                    let hdg = leader.agent.state().hdg.radians();
+                    let vel = leader.agent.state().vel.as_vec2();
+                    (pos, hdg, vel)
                 } else {
-                    // Position-tracking mode: update waypoint to track leader's slot position
-                    drone.agent.update_formation_reference(
-                        state.center, smoothed_heading, leader_velocity,
-                    );
+                    continue;
+                }
+            };
+
+            state.center = leader_pos;
+
+            let target_heading = leader_heading;
+            state.heading = target_heading;
+
+            const HEADING_SMOOTHING: f32 = 0.08;
+
+            let mut heading_diff = target_heading - state.smoothed_heading;
+            while heading_diff > std::f32::consts::PI {
+                heading_diff -= std::f32::consts::TAU;
+            }
+            while heading_diff < -std::f32::consts::PI {
+                heading_diff += std::f32::consts::TAU;
+            }
+
+            state.smoothed_heading += heading_diff * HEADING_SMOOTHING;
+            while state.smoothed_heading > std::f32::consts::PI {
+                state.smoothed_heading -= std::f32::consts::TAU;
+            }
+            while state.smoothed_heading < -std::f32::consts::PI {
+                state.smoothed_heading += std::f32::consts::TAU;
+            }
+
+            let smoothed_heading = state.smoothed_heading;
+            let is_route_mode = state.route_mode;
+            let leader_id = state.leader_id;
+            for drone in &mut self.drones {
+                if !state.drone_ids.contains(&drone.id) {
+                    continue;
+                }
+                if leader_id == Some(drone.id as usize) {
+                    continue;
+                }
+                if drone.agent.in_formation() {
+                    if is_route_mode {
+                        drone.agent.update_formation_reference_no_waypoint(
+                            state.center, smoothed_heading, leader_velocity,
+                        );
+                    } else {
+                        drone.agent.update_formation_reference(
+                            state.center, smoothed_heading, leader_velocity,
+                        );
+                    }
                 }
             }
         }
@@ -1179,28 +1688,6 @@ impl Swarm {
 // ============================================================================
 // HSL to RGB Conversion
 // ============================================================================
-
-fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (u8, u8, u8) {
-    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
-    let h_prime = h / 60.0;
-    let x = c * (1.0 - ((h_prime % 2.0) - 1.0).abs());
-    let m = l - c / 2.0;
-
-    let (r, g, b) = match h_prime as u32 {
-        0 => (c, x, 0.0),
-        1 => (x, c, 0.0),
-        2 => (0.0, c, x),
-        3 => (0.0, x, c),
-        4 => (x, 0.0, c),
-        _ => (c, 0.0, x),
-    };
-
-    (
-        ((r + m) * 255.0) as u8,
-        ((g + m) * 255.0) as u8,
-        ((b + m) * 255.0) as u8,
-    )
-}
 
 // ============================================================================
 // WASM Exports
@@ -1257,6 +1744,44 @@ pub fn clear_selection(handle: &mut SwarmHandle) {
 }
 
 #[wasm_bindgen]
+pub fn attack_target(handle: &mut SwarmHandle, drone_id: u32, target_x: f32, target_y: f32) {
+    handle.swarm.attack_target(drone_id, target_x, target_y);
+}
+
+#[wasm_bindgen]
+pub fn intercept_drone(handle: &mut SwarmHandle, attacker_id: u32, target_drone_id: u32) {
+    handle.swarm.intercept_drone(attacker_id, target_drone_id);
+}
+
+#[wasm_bindgen]
+pub fn return_to_formation(handle: &mut SwarmHandle, drone_id: u32, group_start: u32, group_end: u32) {
+    handle.swarm.return_to_formation(drone_id, group_start, group_end);
+}
+
+#[wasm_bindgen]
+pub fn set_group_split(handle: &mut SwarmHandle, split_id: u32) {
+    handle.swarm.set_group_split(split_id);
+}
+
+#[wasm_bindgen]
+pub fn set_protected_zones(handle: &mut SwarmHandle, group: u32, positions: JsValue) -> Result<(), JsValue> {
+    let positions: Vec<Point> = serde_wasm_bindgen::from_value(positions)
+        .map_err(|e| JsValue::from_str(&format!("Invalid positions: {}", e)))?;
+    handle.swarm.set_protected_zones(group, positions);
+    Ok(())
+}
+
+#[wasm_bindgen]
+pub fn detonate_drone(handle: &mut SwarmHandle, drone_id: u32) {
+    handle.swarm.detonate_drone(drone_id);
+}
+
+#[wasm_bindgen]
+pub fn detonate_selected(handle: &mut SwarmHandle) {
+    handle.swarm.detonate_selected();
+}
+
+#[wasm_bindgen]
 pub fn set_speed(handle: &mut SwarmHandle, multiplier: f32) {
     handle.swarm.set_speed(multiplier);
 }
@@ -1284,6 +1809,19 @@ pub fn assign_route_all(handle: &mut SwarmHandle, waypoints: JsValue) -> Result<
     let waypoints: Vec<Point> = serde_wasm_bindgen::from_value(waypoints)
         .map_err(|e| JsValue::from_str(&format!("Invalid waypoints: {}", e)))?;
     handle.swarm.assign_route_all(waypoints);
+    Ok(())
+}
+
+#[wasm_bindgen]
+pub fn assign_route_range(
+    handle: &mut SwarmHandle,
+    waypoints: JsValue,
+    start_id: u32,
+    end_id: u32,
+) -> Result<(), JsValue> {
+    let waypoints: Vec<Point> = serde_wasm_bindgen::from_value(waypoints)
+        .map_err(|e| JsValue::from_str(&format!("Invalid waypoints: {}", e)))?;
+    handle.swarm.assign_route_range(waypoints, start_id, end_id);
     Ok(())
 }
 
@@ -1392,6 +1930,46 @@ pub fn set_formation(
     };
 
     handle.swarm.set_formation(formation, leader_id.map(|id| id as usize));
+}
+
+/// Set formation for a specific range of drones [start_id, end_id).
+#[wasm_bindgen]
+pub fn set_formation_for_range(
+    handle: &mut SwarmHandle,
+    formation_type: &str,
+    spacing: f32,
+    start_id: u32,
+    end_id: u32,
+) {
+    let spacing_m = handle.swarm.world_scale.px_to_meters(spacing);
+
+    let group_ids: HashSet<u32> = handle.swarm.drones.iter()
+        .filter(|d| d.id >= start_id && d.id < end_id)
+        .map(|d| d.id)
+        .collect();
+
+    let drone_count = group_ids.len();
+    let formation = match formation_type {
+        "line" => FormationType::Line { spacing: spacing_m },
+        "vee" => FormationType::Vee {
+            spacing: spacing_m,
+            angle: std::f32::consts::FRAC_PI_4,
+        },
+        "diamond" => FormationType::Diamond { spacing: spacing_m },
+        "circle" => FormationType::Circle { radius: spacing_m },
+        "grid" => {
+            let cols = (drone_count as f32).sqrt().ceil() as usize;
+            FormationType::Grid { spacing: spacing_m, cols }
+        }
+        "chevron" => FormationType::Chevron {
+            spacing: spacing_m,
+            angle: std::f32::consts::FRAC_PI_4,
+        },
+        _ => FormationType::Line { spacing: spacing_m },
+    };
+
+    let leader_id = group_ids.iter().map(|&id| id as usize).min();
+    handle.swarm.set_formation_for_group(formation, group_ids, leader_id);
 }
 
 /// Clear the current formation, returning drones to independent control.

@@ -51,6 +51,10 @@ pub struct APFConfig {
 
     /// Maximum force magnitude (prevents instability from very close encounters).
     pub max_force: f32,
+
+    /// Influence distance for enemy (different-group) drones (meters).
+    /// When > 0, enemy drones use this instead of `influence_distance`.
+    pub enemy_influence_distance: f32,
 }
 
 impl Default for APFConfig {
@@ -60,6 +64,7 @@ impl Default for APFConfig {
             repulsion_strength: defaults::REPULSION_STRENGTH,
             min_distance: defaults::MIN_DISTANCE,
             max_force: defaults::MAX_FORCE,
+            enemy_influence_distance: 0.0,
         }
     }
 }
@@ -77,6 +82,7 @@ impl APFConfig {
             repulsion_strength,
             min_distance,
             max_force,
+            enemy_influence_distance: 0.0,
         }
     }
 }
@@ -186,6 +192,8 @@ pub fn calculate_apf_from_obstacles(
 /// Calculate repulsive force from other drones using APF.
 ///
 /// Treats each drone as a point obstacle and sums repulsive forces.
+/// Enemy drones (different group) use `enemy_influence_distance` if configured,
+/// producing a much larger repulsive field.
 ///
 /// # Arguments
 /// * `self_pos` - Current drone position
@@ -205,9 +213,25 @@ pub fn calculate_apf_from_swarm(
 ) -> Vec2 {
     let mut total_force = Vec2::new(0.0, 0.0);
 
+    let self_group = swarm.iter()
+        .find(|d| d.uid == self_id)
+        .map(|d| d.group)
+        .unwrap_or(0);
+
     for other in crate::types::neighbors_excluding(swarm, self_id) {
+        let is_enemy = other.group != self_group;
+
+        let effective_config = if is_enemy && config.enemy_influence_distance > 0.0 {
+            APFConfig {
+                influence_distance: config.enemy_influence_distance,
+                ..*config
+            }
+        } else {
+            *config
+        };
+
         let obstacle = Obstacle::point(other.pos);
-        let force = calculate_apf_repulsion(self_pos, &obstacle, bounds, config);
+        let force = calculate_apf_repulsion(self_pos, &obstacle, bounds, &effective_config);
         total_force.x += force.x;
         total_force.y += force.y;
     }
@@ -386,6 +410,7 @@ mod tests {
                 hdg: crate::types::Heading::new(0.0),
                 vel: crate::types::Velocity::zero(),
                 is_formation_leader: false,
+                group: 0,
             },
         ];
 

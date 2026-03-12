@@ -16,9 +16,14 @@
         assignRouteAll,
         getDroneAt,
         selectDronesInRect,
+        activeRoutes,
+        explosions,
+        targets,
+        targetCounts,
+        gameResult,
     } from '$lib/stores/simulation';
 
-    let { width = 1000, height = 1000 } = $props();
+    let { width = 1000, height = 1000, worldWidth = 4000, worldHeight = 4000 } = $props();
 
     let canvas: HTMLCanvasElement;
     let ctx: CanvasRenderingContext2D | null = $state(null);
@@ -30,12 +35,12 @@
     const DRAG_THRESHOLD = 5; // Minimum pixels to consider a drag
 
     // Zoom and pan state
-    let zoom = $state(1.0);
+    let zoom = $state(0.25);
     let panX = $state(0);
     let panY = $state(0);
     let isPanning = $state(false);
     let panStart = $state({ x: 0, y: 0 });
-    const MIN_ZOOM = 0.25;
+    const MIN_ZOOM = 0.1;
     const MAX_ZOOM = 4.0;
     const ZOOM_SENSITIVITY = 0.001;
 
@@ -84,9 +89,24 @@
 
     // Also re-render when path or drag changes
     $effect(() => {
-        if (ctx && ($currentPath || isDragging)) {
+        if (ctx && ($currentPath || isDragging || $activeRoutes)) {
             render();
         }
+    });
+
+    // Animate explosions with continuous re-renders until they fade out
+    $effect(() => {
+        if (!ctx || $explosions.length === 0) return;
+        render();
+        let frame: number;
+        function loop() {
+            render();
+            if ($explosions.length > 0) {
+                frame = requestAnimationFrame(loop);
+            }
+        }
+        frame = requestAnimationFrame(loop);
+        return () => cancelAnimationFrame(frame);
     });
 
     function render() {
@@ -101,12 +121,22 @@
         // Draw grid
         drawGrid();
 
+        // Draw targets
+        for (const target of $targets) {
+            if (!target.destroyed) drawTarget(target);
+        }
+
         // Draw waypoint markers for ALL drones with targets
         drawWaypointMarkers();
 
         // Draw path/route waypoints (show in path mode OR when route mode has waypoints)
-        if ($currentPath.length > 0 && ($pathMode || $objectiveMode === 'route')) {
+        if ($pathMode && $currentPath.length > 0) {
             drawPathWaypoints();
+        } else if ($objectiveMode === 'route') {
+            // Draw both group routes with distinct colors
+            const routes = $activeRoutes;
+            if (routes.a.length > 0) drawGroupRoute(routes.a, 'rgba(157, 255, 32, 0.5)', OLIVE);
+            if (routes.b.length > 0) drawGroupRoute(routes.b, 'rgba(0, 180, 255, 0.5)', 'rgba(0, 90, 128, 1.0)');
         }
 
         // Draw full route paths for all drones in route mode
@@ -135,6 +165,11 @@
             drawDrone(drone);
         }
 
+        // Draw explosion effects (in world space, before restore)
+        for (const explosion of $explosions) {
+            drawExplosion(explosion);
+        }
+
         // Restore transform before drawing UI elements (selection box is in screen space)
         ctx.restore();
 
@@ -146,6 +181,14 @@
         // Draw zoom indicator
         if (zoom !== 1.0) {
             drawZoomIndicator();
+        }
+
+        // Draw target score
+        drawTargetScore();
+
+        // Draw win banner if game is over
+        if ($gameResult) {
+            drawWinBanner();
         }
     }
 
@@ -159,22 +202,86 @@
         ctx.fillText(zoomText, width - 10, height - 10);
     }
 
+    function drawTarget(target: { x: number; y: number; group: 'a' | 'b' }) {
+        if (!ctx) return;
+        const size = 30;
+        const half = size / 2;
+        const color = target.group === 'a' ? 'rgba(255, 60, 60, 0.8)' : 'rgba(60, 140, 255, 0.8)';
+        const border = target.group === 'a' ? 'rgba(255, 120, 120, 1)' : 'rgba(120, 180, 255, 1)';
+
+        ctx.fillStyle = color;
+        ctx.fillRect(target.x - half, target.y - half, size, size);
+        ctx.strokeStyle = border;
+        ctx.lineWidth = 2;
+        ctx.strokeRect(target.x - half, target.y - half, size, size);
+    }
+
+    function drawTargetScore() {
+        if (!ctx) return;
+        const counts = $targetCounts;
+        ctx.font = 'bold 14px "IBM Plex Mono", monospace';
+        ctx.textAlign = 'left';
+        ctx.textBaseline = 'top';
+
+        // Red targets remaining (group A)
+        ctx.fillStyle = 'rgba(255, 60, 60, 0.9)';
+        ctx.fillText(`RED targets: ${counts.a}/3`, 10, 10);
+
+        // Blue targets remaining (group B)
+        ctx.fillStyle = 'rgba(60, 140, 255, 0.9)';
+        ctx.fillText(`BLU targets: ${counts.b}/3`, 10, 30);
+    }
+
+    function drawWinBanner() {
+        if (!ctx) return;
+        const result = $gameResult;
+        let text = '';
+        let color = '';
+        if (result === 'a_wins') {
+            text = 'RED TEAM WINS';
+            color = 'rgba(255, 60, 60, 0.95)';
+        } else if (result === 'b_wins') {
+            text = 'BLUE TEAM WINS';
+            color = 'rgba(60, 140, 255, 0.95)';
+        } else if (result === 'draw') {
+            text = 'DRAW';
+            color = 'rgba(200, 200, 200, 0.95)';
+        }
+
+        // Darken background
+        ctx.fillStyle = 'rgba(0, 0, 0, 0.5)';
+        ctx.fillRect(0, 0, width, height);
+
+        // Banner
+        const bannerH = 80;
+        const bannerY = height / 2 - bannerH / 2;
+        ctx.fillStyle = 'rgba(10, 10, 15, 0.9)';
+        ctx.fillRect(0, bannerY, width, bannerH);
+
+        // Text
+        ctx.font = 'bold 36px "IBM Plex Mono", monospace';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillStyle = color;
+        ctx.fillText(text, width / 2, height / 2);
+    }
+
     function drawGrid() {
         if (!ctx) return;
         ctx.strokeStyle = `rgba(157, 255, 32, ${GRID_OPACITY})`;
         ctx.lineWidth = 1;
 
-        for (let x = GRID_SPACING; x < width; x += GRID_SPACING) {
+        for (let x = GRID_SPACING; x < worldWidth; x += GRID_SPACING) {
             ctx.beginPath();
             ctx.moveTo(x, 0);
-            ctx.lineTo(x, height);
+            ctx.lineTo(x, worldHeight);
             ctx.stroke();
         }
 
-        for (let y = GRID_SPACING; y < height; y += GRID_SPACING) {
+        for (let y = GRID_SPACING; y < worldHeight; y += GRID_SPACING) {
             ctx.beginPath();
             ctx.moveTo(0, y);
-            ctx.lineTo(width, y);
+            ctx.lineTo(worldWidth, y);
             ctx.stroke();
         }
     }
@@ -361,6 +468,71 @@
             ctx.textBaseline = 'middle';
             ctx.fillText(String(i + 1), x, y);
         }
+    }
+
+    function drawGroupRoute(waypoints: { x: number; y: number }[], pointColor: string, lineColor: string) {
+        if (!ctx || waypoints.length === 0) return;
+
+        ctx.lineWidth = 2;
+
+        // Connect with dashed lines
+        if (waypoints.length > 1) {
+            ctx.strokeStyle = lineColor;
+            ctx.setLineDash([5, 5]);
+            ctx.beginPath();
+            ctx.moveTo(waypoints[0].x, waypoints[0].y);
+            for (let i = 1; i < waypoints.length; i++) {
+                ctx.lineTo(waypoints[i].x, waypoints[i].y);
+            }
+            if (waypoints.length > 2) {
+                ctx.lineTo(waypoints[0].x, waypoints[0].y);
+            }
+            ctx.stroke();
+            ctx.setLineDash([]);
+        }
+
+        // Draw waypoint dots with numbers
+        for (let i = 0; i < waypoints.length; i++) {
+            const { x, y } = waypoints[i];
+            ctx.fillStyle = pointColor;
+            ctx.beginPath();
+            ctx.arc(x, y, 12, 0, Math.PI * 2);
+            ctx.fill();
+
+            ctx.fillStyle = 'rgba(10, 10, 15, 0.6)';
+            ctx.font = 'bold 12px "IBM Plex Mono", monospace';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText(String(i + 1), x, y);
+        }
+    }
+
+    function drawExplosion(explosion: { x: number; y: number; radius: number; time: number }) {
+        if (!ctx) return;
+        const elapsed = Date.now() - explosion.time;
+        const duration = 800;
+        if (elapsed >= duration) return;
+
+        // Fade out over duration
+        const progress = elapsed / duration;
+        const alpha = 1.0 - progress;
+
+        // Expanding ring effect
+        const currentRadius = explosion.radius * (0.5 + 0.5 * progress);
+
+        ctx.strokeStyle = `rgba(255, 40, 40, ${alpha})`;
+        ctx.lineWidth = 2;
+        ctx.setLineDash([6, 4]);
+        ctx.beginPath();
+        ctx.arc(explosion.x, explosion.y, currentRadius, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.setLineDash([]);
+
+        // Inner glow fill
+        ctx.fillStyle = `rgba(255, 60, 20, ${alpha * 0.15})`;
+        ctx.beginPath();
+        ctx.arc(explosion.x, explosion.y, currentRadius, 0, Math.PI * 2);
+        ctx.fill();
     }
 
     function drawDrone(drone: typeof $renderState[0]) {

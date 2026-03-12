@@ -51,5 +51,5 @@ pub use conditions::{CollisionImminent, HasTarget};
 // Factory functions
 pub use factory::{
     create_avoidance_only_bt, create_fixed_wing_bt, create_orca_avoidance_only_bt,
-    create_orca_bt, create_seek_only_bt,
+    create_orca_bt, create_orca_bt_with_apf, create_seek_only_bt,
 };

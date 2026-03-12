@@ -42,6 +42,7 @@ pub(crate) mod fixtures {
             hdg: Heading::new(0.0),
             vel: Velocity::zero(),
             is_formation_leader: false,
+            group: 0,
         }
     }
 }

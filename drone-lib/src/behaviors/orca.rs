@@ -54,6 +54,11 @@ pub struct ORCAConfig {
 
     /// Maximum number of neighbors to consider.
     pub max_neighbors: usize,
+
+    /// Avoidance radius for enemy (different-group) drones (meters).
+    /// This is the total separation distance maintained from enemies.
+    /// When 0.0, falls back to `2 * agent_radius`.
+    pub enemy_avoidance_radius: f32,
 }
 
 impl Default for ORCAConfig {
@@ -64,6 +69,7 @@ impl Default for ORCAConfig {
             max_speed: units::DEFAULT_MAX_VELOCITY,
             neighbor_dist: defaults::NEIGHBOR_DIST,
             max_neighbors: defaults::MAX_NEIGHBORS,
+            enemy_avoidance_radius: 0.0,
         }
     }
 }
@@ -83,6 +89,7 @@ impl ORCAConfig {
             max_speed,
             neighbor_dist,
             max_neighbors,
+            enemy_avoidance_radius: 0.0,
         }
     }
 }
@@ -135,21 +142,19 @@ impl HalfPlane {
 /// * `self_vel` - Current agent velocity
 /// * `other_pos` - Neighbor position
 /// * `other_vel` - Neighbor velocity
-/// * `other_is_leader` - Whether the other agent is a formation leader (non-cooperative)
+/// * `responsibility` - Fraction of avoidance this agent takes (0.5 = standard ORCA,
+///   1.0 = full responsibility for non-cooperative agents, >1.0 = aggressive evasion)
 /// * `bounds` - World bounds for toroidal distance
 /// * `config` - ORCA configuration
 ///
 /// # Returns
 /// Half-plane constraint, or None if neighbor is too far.
-///
-/// When `other_is_leader` is true, this agent takes full responsibility for avoidance
-/// (since the leader won't cooperate). Otherwise, takes half responsibility (standard ORCA).
 pub fn compute_orca_half_plane(
     self_pos: Position,
     self_vel: Velocity,
     other_pos: Position,
     other_vel: Velocity,
-    other_is_leader: bool,
+    responsibility: f32,
     bounds: &Bounds,
     config: &ORCAConfig,
 ) -> Option<HalfPlane> {
@@ -273,10 +278,8 @@ pub fn compute_orca_half_plane(
         }
     };
 
-    // ORCA constraint: take responsibility for avoidance
-    // If other agent is non-cooperative (leader), take full responsibility
-    // Otherwise, take half responsibility (standard ORCA reciprocity)
-    let responsibility = if other_is_leader { 1.0 } else { 0.5 };
+    // ORCA constraint: scale the escape vector by the responsibility factor.
+    // 0.5 = standard reciprocity, 1.0 = full responsibility, >1.0 = aggressive evasion.
     let scaled_u = Vec2::new(u.x * responsibility, u.y * responsibility);
     let constraint_point = Vec2::new(
         self_vel_vec.x + scaled_u.x,
@@ -352,6 +355,23 @@ pub fn compute_orca_constraints(
 ) -> Vec<HalfPlane> {
     let mut constraints = Vec::with_capacity(config.max_neighbors);
 
+    // Look up self group for friend/foe distinction
+    let self_group = swarm.iter()
+        .find(|d| d.uid == self_id)
+        .map(|d| d.group)
+        .unwrap_or(0);
+
+    // Detection range must cover the forecast distance for enemy collision courses.
+    // Two drones at max_speed close at 2*max_speed; with 5x time_horizon forecast,
+    // threats can be detected at 2 * max_speed * 5 * time_horizon meters out.
+    let enemy_forecast_dist = if config.enemy_avoidance_radius > 0.0 {
+        2.0 * config.max_speed * config.time_horizon * 5.0
+    } else {
+        0.0
+    };
+    let effective_neighbor_dist = config.neighbor_dist
+        .max(enemy_forecast_dist);
+
     // Collect neighbors sorted by distance
     let mut neighbors: Vec<(usize, f32)> = crate::types::neighbors_excluding(swarm, self_id)
         .map(|d| {
@@ -359,7 +379,7 @@ pub fn compute_orca_constraints(
             let dist_sq = delta.x * delta.x + delta.y * delta.y;
             (d.uid, dist_sq)
         })
-        .filter(|(_, dist_sq)| *dist_sq < config.neighbor_dist * config.neighbor_dist)
+        .filter(|(_, dist_sq)| *dist_sq < effective_neighbor_dist * effective_neighbor_dist)
         .collect();
 
     neighbors.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
@@ -367,14 +387,43 @@ pub fn compute_orca_constraints(
 
     for (neighbor_id, _) in neighbors {
         if let Some(neighbor) = swarm.iter().find(|d| d.uid == neighbor_id) {
+            let is_enemy = neighbor.group != self_group;
+
+            // Responsibility factor:
+            //   0.5 = standard ORCA reciprocity (both sides cooperate)
+            //   1.0 = full responsibility (formation leaders)
+            //   1.5 = aggressive evasion (enemy drones — overcompensate to ensure clearance)
+            let responsibility = if is_enemy {
+                1.5
+            } else if neighbor.is_formation_leader {
+                1.0
+            } else {
+                0.5
+            };
+
+            // For enemy drones: use the blast radius as the collision zone and
+            // forecast much further ahead to detect collision courses early.
+            // The VO cone only triggers when the enemy's trajectory actually leads
+            // into the blast radius within the time horizon — not a static bubble.
+            let effective_config = if is_enemy && config.enemy_avoidance_radius > 0.0 {
+                let mut c = *config;
+                c.agent_radius = config.enemy_avoidance_radius / 2.0;
+                // Long time horizon to forecast collision courses well in advance.
+                // At 240 m/s closing speed, 10s horizon detects threats ~2400m out.
+                c.time_horizon = config.time_horizon * 5.0;
+                c
+            } else {
+                *config
+            };
+
             if let Some(half_plane) = compute_orca_half_plane(
                 self_pos,
                 self_vel,
                 neighbor.pos,
                 neighbor.vel,
-                neighbor.is_formation_leader,
+                responsibility,
                 bounds,
-                config,
+                &effective_config,
             ) {
                 constraints.push(half_plane);
             }
@@ -542,7 +591,7 @@ mod tests {
         let other_vel = Velocity::new(0.0, 0.0);
 
         let result = compute_orca_half_plane(
-            self_pos, self_vel, other_pos, other_vel, false, &bounds, &config,
+            self_pos, self_vel, other_pos, other_vel, 0.5, &bounds, &config,
         );
 
         assert!(result.is_none());
@@ -559,7 +608,7 @@ mod tests {
         let other_vel = Velocity::new(-10.0, 0.0); // Coming toward us
 
         let result = compute_orca_half_plane(
-            self_pos, self_vel, other_pos, other_vel, false, &bounds, &config,
+            self_pos, self_vel, other_pos, other_vel, 0.5, &bounds, &config,
         );
 
         assert!(result.is_some());
@@ -616,6 +665,7 @@ mod tests {
             hdg: Heading::new(0.0),
             vel: Velocity::new(10.0, 0.0),
             is_formation_leader: false,
+            group: 0,
         }];
 
         let constraints = compute_orca_constraints(
@@ -643,6 +693,7 @@ mod tests {
             max_speed: 100.0,
             neighbor_dist: 200.0,
             max_neighbors: 10,
+            enemy_avoidance_radius: 0.0,
         };
 
         // Two drones heading straight at each other
@@ -658,6 +709,7 @@ mod tests {
                 hdg: Heading::new(0.0),
                 vel: self_vel,
                 is_formation_leader: false,
+                group: 0,
             },
             DroneInfo {
                 uid: 1,
@@ -665,6 +717,7 @@ mod tests {
                 hdg: Heading::new(std::f32::consts::PI),
                 vel: other_vel,
                 is_formation_leader: false,
+                group: 0,
             },
         ];
 
@@ -681,6 +734,125 @@ mod tests {
             deflection,
             "Expected deflection, got vel: ({}, {})",
             orca_vel.x, orca_vel.y
+        );
+    }
+
+    #[test]
+    fn test_enemy_group_takes_full_avoidance_responsibility() {
+        let bounds = create_test_bounds();
+        let config = ORCAConfig {
+            time_horizon: 5.0,
+            agent_radius: 15.0,
+            max_speed: 100.0,
+            neighbor_dist: 200.0,
+            max_neighbors: 10,
+            enemy_avoidance_radius: 0.0,
+        };
+
+        let self_pos = Position::new(100.0, 100.0);
+        let self_vel = Velocity::new(30.0, 0.0);
+        let other_pos = Position::new(200.0, 100.0);
+        let other_vel = Velocity::new(-30.0, 0.0);
+
+        // Same group: standard reciprocity (0.5 responsibility each)
+        let swarm_same_group = vec![
+            DroneInfo {
+                uid: 0, pos: self_pos, hdg: Heading::new(0.0),
+                vel: self_vel, is_formation_leader: false, group: 0,
+            },
+            DroneInfo {
+                uid: 1, pos: other_pos, hdg: Heading::new(std::f32::consts::PI),
+                vel: other_vel, is_formation_leader: false, group: 0,
+            },
+        ];
+
+        // Different group: non-cooperative (full responsibility)
+        let swarm_diff_group = vec![
+            DroneInfo {
+                uid: 0, pos: self_pos, hdg: Heading::new(0.0),
+                vel: self_vel, is_formation_leader: false, group: 0,
+            },
+            DroneInfo {
+                uid: 1, pos: other_pos, hdg: Heading::new(std::f32::consts::PI),
+                vel: other_vel, is_formation_leader: false, group: 1,
+            },
+        ];
+
+        let preferred = Vec2::new(30.0, 0.0);
+
+        let vel_same = compute_orca_velocity(
+            self_pos, self_vel, 0, preferred, &swarm_same_group, &bounds, &config,
+        );
+        let vel_diff = compute_orca_velocity(
+            self_pos, self_vel, 0, preferred, &swarm_diff_group, &bounds, &config,
+        );
+
+        // With enemy drone, avoidance should be stronger (larger deflection)
+        let deflection_same = (vel_same.y.abs()).max((preferred.x - vel_same.x).abs());
+        let deflection_diff = (vel_diff.y.abs()).max((preferred.x - vel_diff.x).abs());
+
+        assert!(
+            deflection_diff > deflection_same,
+            "Enemy group should cause stronger avoidance. Same group deflection: {}, diff group: {}",
+            deflection_same, deflection_diff
+        );
+    }
+
+    #[test]
+    fn test_enemy_avoidance_radius_increases_deflection() {
+        let bounds = create_test_bounds();
+
+        // Config WITHOUT enemy avoidance radius
+        let config_no_radius = ORCAConfig {
+            time_horizon: 5.0,
+            agent_radius: 15.0,
+            max_speed: 100.0,
+            neighbor_dist: 300.0,
+            max_neighbors: 10,
+            enemy_avoidance_radius: 0.0,
+        };
+
+        // Config WITH enemy avoidance radius (simulating 1.5x blast radius)
+        let config_with_radius = ORCAConfig {
+            enemy_avoidance_radius: 100.0,
+            ..config_no_radius
+        };
+
+        let self_pos = Position::new(100.0, 100.0);
+        let self_vel = Velocity::new(30.0, 0.0);
+        // Enemy at 150m — beyond enemy_avoidance_radius (100m) so VO cone logic applies,
+        // but close enough that the larger radius creates a wider cone.
+        let other_pos = Position::new(250.0, 110.0);
+        let other_vel = Velocity::new(-30.0, 0.0);
+
+        let swarm = vec![
+            DroneInfo {
+                uid: 0, pos: self_pos, hdg: Heading::new(0.0),
+                vel: self_vel, is_formation_leader: false, group: 0,
+            },
+            DroneInfo {
+                uid: 1, pos: other_pos, hdg: Heading::new(std::f32::consts::PI),
+                vel: other_vel, is_formation_leader: false, group: 1,
+            },
+        ];
+
+        let preferred = Vec2::new(30.0, 0.0);
+
+        let vel_no_radius = compute_orca_velocity(
+            self_pos, self_vel, 0, preferred, &swarm, &bounds, &config_no_radius,
+        );
+        let vel_with_radius = compute_orca_velocity(
+            self_pos, self_vel, 0, preferred, &swarm, &bounds, &config_with_radius,
+        );
+
+        // With the larger enemy avoidance radius, the drone should deflect more
+        let deflection_no = vel_no_radius.y.abs();
+        let deflection_with = vel_with_radius.y.abs();
+
+        assert!(
+            deflection_with > deflection_no,
+            "Enemy avoidance radius should increase deflection. Without: {}, with: {}",
+            deflection_no, deflection_with
         );
     }
 }

@@ -237,8 +237,8 @@ fn compute_min_separation(
         for t_idx in 1..=config.time_samples {
             let t = config.lookahead_time * (t_idx as f32 / config.time_samples as f32);
 
-            let predicted_self = predict_position(self_pos, candidate_heading, current_speed, t, bounds);
-            let predicted_neighbor = predict_position(neighbor.pos, neighbor.hdg, neighbor_speed, t, bounds);
+            let predicted_self = predict_position(self_pos, candidate_heading, current_speed, t);
+            let predicted_neighbor = predict_position(neighbor.pos, neighbor.hdg, neighbor_speed, t);
 
             let separation = bounds.distance(predicted_self.as_vec2(), predicted_neighbor.as_vec2());
             if separation < min_separation {
@@ -304,7 +304,6 @@ fn predict_position(
     heading: Heading,
     speed: f32,
     time: f32,
-    _bounds: &Bounds,
 ) -> Position {
     let distance = speed * time;
     let dx = heading.radians().cos() * distance;
@@ -354,6 +353,7 @@ mod tests {
             hdg: Heading::new(hdg),
             vel: Velocity::from_heading_and_speed(Heading::new(hdg), speed),
             is_formation_leader: false,
+            group: 0,
         }
     }
 

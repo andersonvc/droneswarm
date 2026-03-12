@@ -11,6 +11,10 @@
         restoreActiveRoute,
         assignPath,
         clearSelection,
+        detonateRandomDrone,
+        launchAttack,
+        toggleCAP,
+        capActive,
     } from '$lib/stores/simulation';
     import SimulationCanvas from '$lib/components/SimulationCanvas.svelte';
     import ControlPanel from '$lib/components/ControlPanel.svelte';
@@ -104,6 +108,12 @@
             }
         } else if (e.key === 'Enter' && $pathMode && $currentPath.length > 0) {
             assignPath($currentPath);
+        } else if (e.key === 'd' || e.key === 'D') {
+            detonateRandomDrone();
+        } else if (e.key === 'a' || e.key === 'A') {
+            launchAttack();
+        } else if (e.key === 'c' || e.key === 'C') {
+            toggleCAP();
         } else if (e.key === ' ') {
             e.preventDefault();
             if ($isRunning) {
@@ -133,12 +143,15 @@
             <button class="config-btn" onclick={() => configPanelOpen = true}>
                 Edit Configs
             </button>
+            <button class="cap-btn" class:cap-active={$capActive} onclick={toggleCAP}>
+                {$capActive ? 'CAP Active' : 'Start CAP'}
+            </button>
             <ConfigModal />
             <div class="sidebar-spacer"></div>
             <StatusBar />
         </aside>
         <div class="simulation-container">
-            <SimulationCanvas width={canvasWidth} height={canvasHeight} />
+            <SimulationCanvas width={canvasWidth} height={canvasHeight} worldWidth={4000} worldHeight={4000} />
         </div>
         <DroneTooltip x={tooltipX} y={tooltipY} />
         <PathModeIndicator />
@@ -260,5 +273,31 @@
         background: #252530;
         color: #fff;
         border-color: #9DFF20;
+    }
+
+    .cap-btn {
+        background: #1a1a1f;
+        border: 1px solid #2a2a30;
+        color: #9ca3af;
+        padding: 10px 16px;
+        border-radius: 6px;
+        font-size: 13px;
+        font-family: 'DM Sans', system-ui, sans-serif;
+        cursor: pointer;
+        transition: all 0.15s ease;
+        margin-top: 8px;
+        width: 100%;
+    }
+
+    .cap-btn:hover {
+        background: #252530;
+        color: #fff;
+        border-color: #ff6b35;
+    }
+
+    .cap-btn.cap-active {
+        background: #2a1a10;
+        border-color: #ff6b35;
+        color: #ff6b35;
     }
 </style>

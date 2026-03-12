@@ -49,6 +49,9 @@ pub struct DroneInfo {
     pub vel: Velocity,
     /// Whether this drone is a formation leader (doesn't do ORCA avoidance)
     pub is_formation_leader: bool,
+    /// Group identifier for friend/foe distinction in collision avoidance.
+    /// Drones in different groups are treated as non-cooperative by ORCA.
+    pub group: u32,
 }
 
 impl DroneInfo {
@@ -59,6 +62,7 @@ impl DroneInfo {
             hdg: state.hdg,
             vel: state.vel,
             is_formation_leader: false,
+            group: 0,
         }
     }
 
@@ -70,6 +74,7 @@ impl DroneInfo {
             hdg: state.hdg,
             vel: state.vel,
             is_formation_leader,
+            group: 0,
         }
     }
 }

@@ -108,6 +108,7 @@ mod tests {
             hdg: Heading::new(0.0),
             vel: Velocity::zero(),
             is_formation_leader: false,
+            group: 0,
         };
         let swarm = [far_drone];
         let mut ctx = BehaviorContext::new(&state, &swarm, &bounds, 0, 0.016, test_perf());
@@ -127,6 +128,7 @@ mod tests {
             hdg: Heading::new(0.0),
             vel: Velocity::zero(),
             is_formation_leader: false,
+            group: 0,
         };
         let swarm = [close_drone];
         let mut ctx = BehaviorContext::new(&state, &swarm, &bounds, 0, 0.016, test_perf());
@@ -147,6 +149,7 @@ mod tests {
             hdg: Heading::new(0.0),
             vel: Velocity::zero(),
             is_formation_leader: false,
+            group: 0,
         };
         let swarm = [self_drone];
         let mut ctx = BehaviorContext::new(&state, &swarm, &bounds, 0, 0.016, test_perf());

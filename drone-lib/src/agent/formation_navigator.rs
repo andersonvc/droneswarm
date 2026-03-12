@@ -247,6 +247,15 @@ impl FormationNavigator {
 
     // ===== Navigation computation =====
 
+    /// Default approach gate configuration for formation joining.
+    fn default_gate_config() -> ApproachGateConfig {
+        ApproachGateConfig {
+            ball_radius: defaults::APPROACH_BALL_RADIUS,
+            gate_offset: defaults::APPROACH_GATE_OFFSET,
+            angle_tolerance: defaults::APPROACH_ANGLE_TOLERANCE,
+        }
+    }
+
     /// Compute the world position of the current formation slot.
     ///
     /// Returns `None` if not fully configured (missing slot, center, or heading).
@@ -323,11 +332,7 @@ impl FormationNavigator {
             }
         } else {
             // INTERCEPT MODE
-            let gate_config = ApproachGateConfig {
-                ball_radius: defaults::APPROACH_BALL_RADIUS,
-                gate_offset: defaults::APPROACH_GATE_OFFSET,
-                angle_tolerance: defaults::APPROACH_ANGLE_TOLERANCE,
-            };
+            let gate_config = Self::default_gate_config();
 
             let needs_gate = PathPlanner::needs_approach_gate(
                 my_pos,
@@ -496,11 +501,7 @@ impl FormationNavigator {
         } else if dist < station_keeping_dist {
             FormationApproachMode::Correction
         } else {
-            let gate_config = ApproachGateConfig {
-                ball_radius: defaults::APPROACH_BALL_RADIUS,
-                gate_offset: defaults::APPROACH_GATE_OFFSET,
-                angle_tolerance: defaults::APPROACH_ANGLE_TOLERANCE,
-            };
+            let gate_config = Self::default_gate_config();
 
             let needs_gate = PathPlanner::needs_approach_gate(
                 my_pos,

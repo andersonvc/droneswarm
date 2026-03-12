@@ -86,15 +86,25 @@ pub fn create_orca_bt(
     orca_config: ORCAConfig,
     sep_config: SeparationConfig,
 ) -> Box<dyn BehaviorNode> {
+    create_orca_bt_with_apf(orca_config, sep_config, None)
+}
+
+/// Create a fixed-wing behavior tree using ORCA + APF with custom APF config.
+pub fn create_orca_bt_with_apf(
+    orca_config: ORCAConfig,
+    sep_config: SeparationConfig,
+    apf_config: Option<APFConfig>,
+) -> Box<dyn BehaviorNode> {
     // APF config for emergency close-range avoidance
     // Very high repulsion to produce meaningful force at distance
     // Force = η * (1/d - 1/d0) / d² must exceed 1.0 to trigger avoidance
-    let apf_config = APFConfig {
+    let apf_config = apf_config.unwrap_or(APFConfig {
         influence_distance: 150.0,      // Wide range
         repulsion_strength: 10000000.0, // Very high - needed for 1/d² falloff
         min_distance: 35.0,             // Hard boundary - larger for multi-drone scenarios
         max_force: 80.0,                // Lower cap = higher urgency ratio
-    };
+        enemy_influence_distance: 0.0,
+    });
 
     Box::new(Selector::new(
         "root",
@@ -105,7 +115,12 @@ pub fn create_orca_bt(
                 vec![
                     Box::new(SeekWaypoint::new()),
                     Box::new(ORCAAvoid::with_config(orca_config)),
-                    Box::new(APFAvoid::with_config(apf_config)),
+                    // Higher force weight when enemy avoidance is active
+                    if apf_config.enemy_influence_distance > 0.0 {
+                        Box::new(APFAvoid::with_config_and_weight(apf_config, 0.9))
+                    } else {
+                        Box::new(APFAvoid::with_config(apf_config))
+                    },
                 ],
             )),
             // Fallback: separation only (for idle/emergency)
@@ -128,6 +143,7 @@ pub fn create_orca_avoidance_only_bt(
         repulsion_strength: 10000000.0,
         min_distance: 35.0,
         max_force: 80.0,
+        enemy_influence_distance: 0.0,
     };
 
     // Run both ORCA and APF in sequence

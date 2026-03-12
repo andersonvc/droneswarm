@@ -27,20 +27,13 @@ pub mod platform;
 pub mod swarm;
 pub mod types;
 
-/// Backward-compatible re-export of the `Drone` trait (moved to `agent::traits`).
-pub mod models {
-    pub mod drone {
-        pub use crate::agent::Drone;
-    }
-}
-
 // Agent module exports
 pub use agent::{Drone, DroneAgent, FormationApproachMode};
 
 // Behavior module exports
 pub use behaviors::{
-    calculate_separation, calculate_velocity_obstacle, get_recommended_heading, AvoidanceResult,
-    SeparationConfig, VelocityObstacleConfig, COLLISION_RADIUS,
+    calculate_separation, calculate_velocity_obstacle, get_recommended_heading, APFConfig,
+    AvoidanceResult, SeparationConfig, VelocityObstacleConfig, COLLISION_RADIUS,
 };
 
 // Type exports

@@ -10,11 +10,20 @@ import init, {
     assign_path,
     assign_waypoint_all,
     assign_route_all,
+    attack_target,
+    detonate_drone,
+    detonate_selected,
+    assign_route_range,
+    set_formation_for_range,
     get_drone_at,
     set_flight_params,
     set_avoidance_lookahead,
     set_orca_config,
     set_waypoint_clearance,
+    intercept_drone,
+    return_to_formation,
+    set_group_split,
+    set_protected_zones,
     set_consensus_protocol,
     set_formation,
     clear_formation,
@@ -116,6 +125,41 @@ export class SwarmManager {
         clear_selection(this.handle);
     }
 
+    attackTarget(droneId: number, targetX: number, targetY: number): void {
+        if (!this.handle) return;
+        attack_target(this.handle, droneId, targetX, targetY);
+    }
+
+    detonateDrone(droneId: number): void {
+        if (!this.handle) return;
+        detonate_drone(this.handle, droneId);
+    }
+
+    detonateSelected(): void {
+        if (!this.handle) return;
+        detonate_selected(this.handle);
+    }
+
+    interceptDrone(attackerId: number, targetDroneId: number): void {
+        if (!this.handle) return;
+        intercept_drone(this.handle, attackerId, targetDroneId);
+    }
+
+    returnToFormation(droneId: number, groupStart: number, groupEnd: number): void {
+        if (!this.handle) return;
+        return_to_formation(this.handle, droneId, groupStart, groupEnd);
+    }
+
+    setGroupSplit(splitId: number): void {
+        if (!this.handle) return;
+        set_group_split(this.handle, splitId);
+    }
+
+    setProtectedZones(group: number, positions: Point[]): void {
+        if (!this.handle) return;
+        set_protected_zones(this.handle, group, positions);
+    }
+
     setSpeed(speed: number): void {
         if (!this.handle) return;
         set_speed(this.handle, speed);
@@ -139,6 +183,11 @@ export class SwarmManager {
     assignRouteAll(waypoints: Point[]): void {
         if (!this.handle) return;
         assign_route_all(this.handle, waypoints);
+    }
+
+    assignRouteRange(waypoints: Point[], startId: number, endId: number): void {
+        if (!this.handle) return;
+        assign_route_range(this.handle, waypoints, startId, endId);
     }
 
     getDroneAt(x: number, y: number, hitRadius: number = 20): number | undefined {
@@ -183,6 +232,11 @@ export class SwarmManager {
     setFormation(formationType: string, spacing: number, leaderId?: number): void {
         if (!this.handle) return;
         set_formation(this.handle, formationType, spacing, leaderId ?? null);
+    }
+
+    setFormationForRange(formationType: string, spacing: number, startId: number, endId: number): void {
+        if (!this.handle) return;
+        set_formation_for_range(this.handle, formationType, spacing, startId, endId);
     }
 
     clearFormation(): void {

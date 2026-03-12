@@ -1,13 +1,46 @@
 import { base } from '$app/paths';
-import type { SimulationConfig } from './bridge';
+import type { SimulationConfig, Point } from './bridge';
+
+export const CLUSTER_A = { center: { x: 760, y: 760 }, radius: 240 };
+export const CLUSTER_B = { center: { x: 3240, y: 3240 }, radius: 240 };
+
+export function generateTwoClusterPositions(
+    droneCount: number,
+    clusterA: { center: Point; radius: number },
+    clusterB: { center: Point; radius: number },
+): Point[] {
+    const halfA = Math.ceil(droneCount / 2);
+    const halfB = droneCount - halfA;
+    const positions: Point[] = [];
+
+    for (let i = 0; i < halfA; i++) {
+        const angle = Math.random() * Math.PI * 2;
+        const r = Math.sqrt(Math.random()) * clusterA.radius;
+        positions.push({
+            x: clusterA.center.x + r * Math.cos(angle),
+            y: clusterA.center.y + r * Math.sin(angle),
+        });
+    }
+    for (let i = 0; i < halfB; i++) {
+        const angle = Math.random() * Math.PI * 2;
+        const r = Math.sqrt(Math.random()) * clusterB.radius;
+        positions.push({
+            x: clusterB.center.x + r * Math.cos(angle),
+            y: clusterB.center.y + r * Math.sin(angle),
+        });
+    }
+    return positions;
+}
+
+const DEFAULT_DRONE_COUNT = 50;
 
 const DEFAULT_CONFIG: SimulationConfig = {
-    droneCount: 50, // Matches 'large' swarm size
-    spawnPattern: { cluster: { center: { x: 550, y: 508 }, radius: 480 } },
-    bounds: { width: 1000, height: 1000 }, // Canvas size in pixels
+    droneCount: DEFAULT_DRONE_COUNT,
+    spawnPattern: { custom: { positions: generateTwoClusterPositions(DEFAULT_DRONE_COUNT, CLUSTER_A, CLUSTER_B) } },
+    bounds: { width: 4000, height: 4000 },
     speedMultiplier: 8.0,
-    worldWidthMeters: 2500, // Real-world size in meters
-    worldHeightMeters: 2500,
+    worldWidthMeters: 10000,
+    worldHeightMeters: 10000,
 };
 
 export async function loadConfig(): Promise<SimulationConfig> {

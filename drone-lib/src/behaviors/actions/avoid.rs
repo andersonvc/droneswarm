@@ -487,6 +487,7 @@ mod tests {
             hdg: Heading::new(std::f32::consts::PI), // Coming toward us
             vel: Velocity::from_heading_and_speed(Heading::new(std::f32::consts::PI), 60.0),
             is_formation_leader: false,
+            group: 0,
         };
         let swarm = [threat];
 
@@ -540,6 +541,7 @@ mod tests {
             hdg: Heading::new(0.0),
             vel: Velocity::zero(),
             is_formation_leader: false,
+            group: 0,
         };
         let swarm = [neighbor];
 
@@ -582,6 +584,7 @@ mod tests {
             hdg: Heading::new(0.0),
             vel: Velocity::zero(),
             is_formation_leader: false,
+            group: 0,
         };
         let swarm = [threat];
 
@@ -617,6 +620,7 @@ mod tests {
             hdg: Heading::new(0.0),
             vel: Velocity::zero(),
             is_formation_leader: false,
+            group: 0,
         };
         let swarm = [threat];
 
@@ -670,6 +674,7 @@ mod tests {
             hdg: Heading::new(0.0),
             vel: Velocity::zero(),
             is_formation_leader: false,
+            group: 0,
         };
         let swarm = [threat];
 
@@ -697,6 +702,7 @@ mod tests {
             hdg: Heading::new(0.0),
             vel: Velocity::zero(),
             is_formation_leader: false,
+            group: 0,
         };
         let swarm = [threat];
 
@@ -760,6 +766,7 @@ mod tests {
             hdg: Heading::new(std::f32::consts::PI), // Coming toward us
             vel: Velocity::from_heading_and_speed(Heading::new(std::f32::consts::PI), 7.5), // 7.5 m/s
             is_formation_leader: false,
+            group: 0,
         };
         let swarm = [threat];
 
@@ -805,6 +812,7 @@ mod tests {
             hdg: Heading::new(std::f32::consts::PI),
             vel: Velocity::from_heading_and_speed(Heading::new(std::f32::consts::PI), 60.0),
             is_formation_leader: false,
+            group: 0,
         };
         let swarm = [threat];
 
@@ -833,6 +841,7 @@ mod tests {
                 hdg: Heading::new(std::f32::consts::PI),
                 vel: Velocity::from_heading_and_speed(Heading::new(std::f32::consts::PI), 60.0),
                 is_formation_leader: false,
+                group: 0,
             },
             DroneInfo {
                 uid: 2,
@@ -840,6 +849,7 @@ mod tests {
                 hdg: Heading::new(-std::f32::consts::FRAC_PI_2),
                 vel: Velocity::from_heading_and_speed(Heading::new(-std::f32::consts::FRAC_PI_2), 60.0),
                 is_formation_leader: false,
+                group: 0,
             },
         ];
 
