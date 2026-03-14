@@ -23,8 +23,14 @@ pub mod agent;
 pub mod behaviors;
 pub mod messages;
 pub mod missions;
+pub mod doctrine;
+#[cfg(feature = "inference")]
+pub mod inference;
 pub mod platform;
+pub mod sim_runner;
+pub mod strategies;
 pub mod swarm;
+pub mod tasks;
 pub mod types;
 
 // Agent module exports
@@ -65,3 +71,12 @@ pub use swarm::{
 
 // Comms module exports
 pub use messages::{FormationCommand, FormationSlot, PathProgress, VelocityConsensus};
+
+// Task module exports
+pub use tasks::{DroneTask, SafetyFeedback, TaskOutput, TaskStatus};
+
+// Strategy module exports
+pub use strategies::{StrategyDroneState, SwarmStrategy, TaskAssignment};
+
+// Safety layer export
+pub use behaviors::safety::SafetyLayer;

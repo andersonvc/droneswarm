@@ -7,6 +7,8 @@ use crate::behaviors::tree::node::{BehaviorContext, BehaviorNode};
 use crate::behaviors::{
     create_orca_bt_with_apf, APFConfig, ORCAConfig, SeparationConfig,
 };
+use crate::behaviors::safety::SafetyLayer;
+use crate::tasks::{DroneTask, TaskStatus};
 use crate::messages::{FormationCommand, FormationSlot, VelocityConsensus};
 use crate::missions::{CommandQueue, Mission, Task, WaypointMission};
 use super::formation_navigator::FormationNavigator;
@@ -15,6 +17,7 @@ use crate::platform::{GenericPlatform, Platform};
 use crate::swarm::formation::defaults as formation_defaults;
 use crate::types::{
     units, Bounds, DroneInfo, DronePerfFeatures, Heading, Objective, Position, State, Vec2,
+    Velocity,
 };
 
 /// Formation approach mode for visualization.
@@ -63,8 +66,13 @@ pub struct DroneAgent {
     formation: FormationNavigator,
     /// Group identifier for friend/foe distinction.
     group: u32,
-    /// Urgency from previous tick — used to suppress waypoint seeking during evasion.
-    last_urgency: f32,
+    /// Active task state machine (intercept, attack, etc.)
+    /// When set, bypasses the behavior tree and uses the task→safety pipeline.
+    active_task: Option<Box<dyn DroneTask>>,
+    /// Safety layer for collision avoidance (used with task pipeline).
+    safety_layer: SafetyLayer,
+    /// Whether the task requested detonation this tick.
+    pending_detonate: bool,
 }
 
 impl DroneAgent {
@@ -85,7 +93,9 @@ impl DroneAgent {
             waypoint_clearance: DEFAULT_WAYPOINT_CLEARANCE,
             formation: FormationNavigator::new(),
             group: 0,
-            last_urgency: 0.0,
+            active_task: None,
+            safety_layer: SafetyLayer::new(orca_config, APFConfig::default()),
+            pending_detonate: false,
         }
     }
 
@@ -125,33 +135,89 @@ impl DroneAgent {
         // 1. Process pending commands
         self.process_commands();
 
+        // If an active task is set, use the task→safety→platform pipeline.
+        // Otherwise, use the legacy behavior tree pipeline.
+        if self.active_task.is_some() {
+            self.state_update_task(dt, swarm);
+        } else {
+            self.state_update_bt(dt, swarm);
+        }
+    }
+
+    /// Task-based update: task→safety→platform pipeline.
+    ///
+    /// The task selects a behavior and produces a desired velocity.
+    /// The safety layer adjusts it for collision avoidance.
+    /// Feedback flows back to the task for phase transitions.
+    fn state_update_task(&mut self, dt: f32, swarm: &[DroneInfo]) {
+        let task = self.active_task.as_mut().unwrap();
+
+        // 1. Task tick: assess situation, select behavior, produce desired velocity
+        let output = task.tick(
+            self.platform.state(),
+            swarm,
+            self.platform.bounds(),
+            self.platform.perf(),
+            dt,
+        );
+
+        // 2. Check for detonation (handled by caller via should_detonate())
+        // Store the detonate flag for the simulation to check
+        self.pending_detonate = output.detonate;
+
+        // 3. Safety layer: adjust velocity for collision avoidance.
+        //    If intercepting a target, exclude that drone from the swarm
+        //    so ORCA/APF won't push us away from it (kamikaze behavior).
+        let (safe_vel, feedback) = if !output.exclude_from_ca.is_empty() {
+            let filtered: Vec<DroneInfo> = swarm.iter()
+                .copied()
+                .filter(|d| !output.exclude_from_ca.contains(&d.uid))
+                .collect();
+            self.safety_layer.apply(
+                output.desired_velocity,
+                self.platform.state(),
+                self.id,
+                &filtered,
+                self.platform.bounds(),
+            )
+        } else {
+            self.safety_layer.apply(
+                output.desired_velocity,
+                self.platform.state(),
+                self.id,
+                swarm,
+                self.platform.bounds(),
+            )
+        };
+
+        // 4. Feed safety feedback back to task for phase transitions
+        let task = self.active_task.as_mut().unwrap();
+        task.process_feedback(&feedback);
+
+        // 5. Apply safe velocity to platform
+        let heading = output.desired_heading.unwrap_or_else(|| {
+            let speed = safe_vel.magnitude();
+            if speed > f32::EPSILON {
+                Heading::new(safe_vel.y.atan2(safe_vel.x))
+            } else {
+                self.platform.state().hdg
+            }
+        });
+        self.platform.apply_velocity_steering(
+            Velocity::from_vec2(safe_vel),
+            Some(heading),
+            dt,
+        );
+    }
+
+    /// Legacy behavior tree update pipeline.
+    /// Used for formation following, regular navigation, etc.
+    fn state_update_bt(&mut self, dt: f32, swarm: &[DroneInfo]) {
         // 2. Update mission state (waypoint arrivals)
         self.mission.update(self.platform.state(), self.waypoint_clearance);
 
         // 3. Get desired heading from mission
         let mut desired_heading = self.mission.get_desired_heading(self.platform.state());
-
-        // 3a. Suppress mission heading when urgency is high from previous tick.
-        // Without this, SeekWaypoint points the drone straight at the enemy every tick,
-        // and ORCA finds the nearest safe velocity to "toward enemy" — barely skirting
-        // the blast zone instead of truly evading. By using the current travel heading
-        // as the preferred direction, ORCA can compute a proper evasion maneuver.
-        if self.last_urgency > 0.3 && desired_heading.is_some() {
-            let current_hdg = self.platform.state().hdg;
-            if self.last_urgency > 0.7 {
-                // High urgency: fully override with current heading
-                desired_heading = Some(current_hdg);
-            } else {
-                // Medium urgency: blend between current heading and mission heading
-                let blend = (self.last_urgency - 0.3) / 0.4; // 0.0 at 0.3, 1.0 at 0.7
-                let mission_hdg = desired_heading.unwrap();
-                let delta = crate::types::normalize_angle(
-                    mission_hdg.radians() - current_hdg.radians(),
-                );
-                let blended = current_hdg.radians() + (1.0 - blend) * delta;
-                desired_heading = Some(Heading::new(blended));
-            }
-        }
 
         // 3b. Determine if this follower is in route-following mode
         let is_follower_route_mode = self.formation.in_formation()
@@ -208,9 +274,6 @@ impl DroneAgent {
 
         // 5. Tick behavior tree (applies avoidance, modifies context)
         self.behavior_tree.tick(&mut ctx);
-
-        // Save urgency for next tick's heading suppression
-        self.last_urgency = ctx.urgency;
 
         // 6. Apply steering to platform (quadcopter-style: velocity independent of heading)
         let max_speed = self.platform.perf().max_vel;
@@ -356,12 +419,14 @@ impl DroneAgent {
     /// Set APF collision avoidance configuration.
     pub fn set_apf_config(&mut self, config: APFConfig) {
         self.apf_config = Some(config);
+        self.safety_layer.apf_config = config;
         self.rebuild_behavior_tree();
     }
 
     /// Set ORCA collision avoidance configuration.
     pub fn set_orca_config(&mut self, config: ORCAConfig) {
         self.orca_config = config;
+        self.safety_layer.orca_config = config;
         self.rebuild_behavior_tree();
     }
 
@@ -384,6 +449,41 @@ impl DroneAgent {
     /// Rebuild behavior tree with current configurations.
     fn rebuild_behavior_tree(&mut self) {
         self.behavior_tree = create_orca_bt_with_apf(self.orca_config, self.sep_config, self.apf_config);
+    }
+
+    // ===== Task pipeline methods =====
+
+    /// Set an active task, switching to the task→safety pipeline.
+    /// Clears the current mission.
+    pub fn set_task(&mut self, task: Box<dyn DroneTask>) {
+        self.active_task = Some(task);
+        self.pending_detonate = false;
+        // Sync safety layer configs
+        self.safety_layer.orca_config = self.orca_config;
+        if let Some(apf) = self.apf_config {
+            self.safety_layer.apf_config = apf;
+        }
+    }
+
+    /// Clear the active task, returning to the behavior tree pipeline.
+    pub fn clear_task(&mut self) {
+        self.active_task = None;
+        self.pending_detonate = false;
+    }
+
+    /// Check if the task has requested detonation.
+    pub fn should_detonate(&self) -> bool {
+        self.pending_detonate
+    }
+
+    /// Get the active task status (if any).
+    pub fn task_status(&self) -> Option<TaskStatus> {
+        self.active_task.as_ref().map(|t| t.status())
+    }
+
+    /// Get the active task name and phase (for rendering/debugging).
+    pub fn task_info(&self) -> Option<(&str, &str)> {
+        self.active_task.as_ref().map(|t| (t.name(), t.phase_name()))
     }
 
     /// Get spline path for visualization (wasm-lib compatibility).

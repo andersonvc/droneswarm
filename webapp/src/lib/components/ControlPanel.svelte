@@ -1,9 +1,7 @@
 <script lang="ts">
-    import { isRunning, pathMode, objectiveMode } from '$lib/stores/simulation';
+    import { isRunning } from '$lib/stores/simulation';
     import Button from './Button.svelte';
     import SpeedSlider from './SpeedSlider.svelte';
-    import ModeSelector from './ModeSelector.svelte';
-    import SwarmSizeSelector from './SwarmSizeSelector.svelte';
 
     interface Props {
         onStart: () => void;
@@ -24,21 +22,7 @@
         <Button variant="secondary" onclick={onReset}>Reset</Button>
     </div>
 
-    <SwarmSizeSelector />
-
-    <ModeSelector />
-
     <SpeedSlider />
-
-    {#if $pathMode}
-        <div class="path-hint">
-            {#if $objectiveMode === 'route'}
-                Click to add route nodes, Right-click to confirm (loops)
-            {:else}
-                Click to add waypoints, Right-click to confirm
-            {/if}
-        </div>
-    {/if}
 </div>
 
 <style>
@@ -55,12 +39,5 @@
 
     .playback-controls :global(button) {
         flex: 1;
-    }
-
-    .path-hint {
-        color: #9DFF20;
-        font-size: 12px;
-        font-family: 'IBM Plex Mono', monospace;
-        line-height: 1.4;
     }
 </style>

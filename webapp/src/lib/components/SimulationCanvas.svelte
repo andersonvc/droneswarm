@@ -225,11 +225,11 @@
 
         // Red targets remaining (group A)
         ctx.fillStyle = 'rgba(255, 60, 60, 0.9)';
-        ctx.fillText(`RED targets: ${counts.a}/3`, 10, 10);
+        ctx.fillText(`RED targets: ${counts.a}/6`, 10, 10);
 
         // Blue targets remaining (group B)
         ctx.fillStyle = 'rgba(60, 140, 255, 0.9)';
-        ctx.fillText(`BLU targets: ${counts.b}/3`, 10, 30);
+        ctx.fillText(`BLU targets: ${counts.b}/6`, 10, 30);
     }
 
     function drawWinBanner() {

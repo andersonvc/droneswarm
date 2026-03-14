@@ -58,7 +58,7 @@ const TARGET_SIZE = 30; // visual size in world px (half-width for hit detection
 function generateTargets(): Target[] {
     const targets: Target[] = [];
     // Red targets ('a') near Group A's territory (top-left quadrant)
-    for (let i = 0; i < 3; i++) {
+    for (let i = 0; i < 6; i++) {
         targets.push({
             id: i,
             x: 900 + Math.random() * 700,
@@ -68,9 +68,9 @@ function generateTargets(): Target[] {
         });
     }
     // Blue targets ('b') near Group B's territory (bottom-right quadrant)
-    for (let i = 0; i < 3; i++) {
+    for (let i = 0; i < 6; i++) {
         targets.push({
-            id: 3 + i,
+            id: 6 + i,
             x: 2400 + Math.random() * 700,
             y: 2400 + Math.random() * 700,
             group: 'b',
@@ -199,6 +199,11 @@ export const formationConfig = writable<FormationConfig>({
     leaderId: undefined,
 });
 
+// Strategy configuration per group
+export type StrategyType = 'none' | 'defend_area' | 'attack_zone' | 'patrol_perimeter' | 'doctrine_aggressive' | 'doctrine_defensive' | 'doctrine_rl';
+export const groupAStrategy = writable<StrategyType>('patrol_perimeter');
+export const groupBStrategy = writable<StrategyType>('patrol_perimeter');
+
 // Legacy - kept for compatibility with AvoidanceSlider
 export const avoidanceLookahead = writable(1.0);
 
@@ -233,13 +238,27 @@ export async function initSimulation(config?: SimulationConfig): Promise<void> {
     manager.setFormationForRange('chevron', spacing, 0, halfCount);
     manager.setFormationForRange('chevron', spacing, halfCount, finalConfig.droneCount);
 
-    // Assign separate routes — formation-aware (only leaders get routes)
-    manager.assignRouteRange(ROUTE_A, 0, halfCount);
-    manager.assignRouteRange(ROUTE_B, halfCount, finalConfig.droneCount);
+    // Build patrol routes around each group's friendly targets
+    const currentTargets = get(targets);
+    const friendlyA = currentTargets.filter(t => t.group === 'a' && !t.destroyed);
+    const friendlyB = currentTargets.filter(t => t.group === 'b' && !t.destroyed);
+    const routeA = friendlyA.length > 0 ? buildPatrolRoute(friendlyA) : ROUTE_A;
+    const routeB = friendlyB.length > 0 ? buildPatrolRoute(friendlyB) : ROUTE_B;
 
-    activeRoute.set(ROUTE_A);
-    activeRoutes.set({ a: ROUTE_A, b: ROUTE_B });
-    currentPath.set(ROUTE_A);
+    // Assign separate routes — formation-aware (only leaders get routes)
+    manager.assignRouteRange(routeA, 0, halfCount);
+    manager.assignRouteRange(routeB, halfCount, finalConfig.droneCount);
+
+    activeRoute.set(routeA);
+    activeRoutes.set({ a: routeA, b: routeB });
+    currentPath.set(routeA);
+
+    // Apply default strategies
+    const defaultA = get(groupAStrategy);
+    const defaultB = get(groupBStrategy);
+    if (defaultA !== 'none') applyStrategy(0, defaultA);
+    if (defaultB !== 'none') applyStrategy(1, defaultB);
+
     updateRenderState();
 }
 
@@ -255,6 +274,14 @@ function updateProtectedZones(): void {
         .map(t => ({ x: t.x, y: t.y }));
     manager.setProtectedZones(0, zoneA); // group 0 defends 'a' targets
     manager.setProtectedZones(1, zoneB); // group 1 defends 'b' targets
+
+    // Update doctrine strategies with current target state
+    manager.updateDoctrineTargets(0, zoneA, zoneB); // group 0: friendly=A, enemy=B
+    manager.updateDoctrineTargets(1, zoneB, zoneA); // group 1: friendly=B, enemy=A
+
+    // Sync RL agent target counts
+    manager.updateRlTargets(0, zoneA.length, zoneB.length);
+    manager.updateRlTargets(1, zoneB.length, zoneA.length);
 }
 
 export async function reinitializeWithSize(size: SwarmSize): Promise<void> {
@@ -515,6 +542,17 @@ const DEFENSE_RESERVE = 0.4;
 /** Tracks the initial group split point (set during init) */
 let groupSplitId = 25;
 
+/** Cached RL model JSON (fetched once, reused). */
+let rlModelJsonCache: string | null = null;
+
+async function loadRlModelJson(): Promise<string> {
+    if (rlModelJsonCache) return rlModelJsonCache;
+    const resp = await fetch('/models/best_model.json');
+    if (!resp.ok) throw new Error(`Failed to load RL model: ${resp.statusText}`);
+    rlModelJsonCache = await resp.text();
+    return rlModelJsonCache;
+}
+
 /**
  * Assign multiple drones from a group to attack all surviving enemy targets.
  * Distributes drones evenly across targets, respecting a defense reserve.
@@ -594,20 +632,81 @@ const CAP_RECALL_INTERVAL = 60;
 let capTickCounter = 0;
 
 /**
- * Build a patrol route that loops around a set of targets.
+ * Compute the convex hull of a set of points (Andrew's monotone chain).
+ * Returns points in counter-clockwise order.
+ */
+function convexHull(points: Point[]): Point[] {
+    if (points.length <= 1) return [...points];
+
+    const sorted = [...points].sort((a, b) => a.x - b.x || a.y - b.y);
+    const n = sorted.length;
+
+    // Cross product of vectors OA and OB where O is origin
+    const cross = (o: Point, a: Point, b: Point) =>
+        (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x);
+
+    // Lower hull
+    const lower: Point[] = [];
+    for (const p of sorted) {
+        while (lower.length >= 2 && cross(lower[lower.length - 2], lower[lower.length - 1], p) <= 0)
+            lower.pop();
+        lower.push(p);
+    }
+
+    // Upper hull
+    const upper: Point[] = [];
+    for (let i = n - 1; i >= 0; i--) {
+        const p = sorted[i];
+        while (upper.length >= 2 && cross(upper[upper.length - 2], upper[upper.length - 1], p) <= 0)
+            upper.pop();
+        upper.push(p);
+    }
+
+    // Remove last point of each half because it's repeated
+    lower.pop();
+    upper.pop();
+    return [...lower, ...upper];
+}
+
+/**
+ * Build a convex patrol route around a set of targets.
+ * Computes convex hull of target positions, then pushes each vertex
+ * outward by CAP_PATROL_STANDOFF from the centroid.
  */
 function buildPatrolRoute(friendlyTargets: Target[]): Point[] {
     if (friendlyTargets.length === 0) return [];
-    const cx = friendlyTargets.reduce((s, t) => s + t.x, 0) / friendlyTargets.length;
-    const cy = friendlyTargets.reduce((s, t) => s + t.y, 0) / friendlyTargets.length;
-    const sorted = [...friendlyTargets].sort((a, b) =>
-        Math.atan2(a.y - cy, a.x - cx) - Math.atan2(b.y - cy, b.x - cx)
-    );
-    return sorted.map(t => {
-        const dx = t.x - cx;
-        const dy = t.y - cy;
+
+    const targetPoints = friendlyTargets.map(t => ({ x: t.x, y: t.y }));
+
+    // For 1-2 targets, create a simple polygon around them
+    if (targetPoints.length <= 2) {
+        const cx = targetPoints.reduce((s, p) => s + p.x, 0) / targetPoints.length;
+        const cy = targetPoints.reduce((s, p) => s + p.y, 0) / targetPoints.length;
+        // Generate a square/hexagon around the centroid
+        const count = 4;
+        const route: Point[] = [];
+        for (let i = 0; i < count; i++) {
+            const angle = (i / count) * Math.PI * 2;
+            route.push({
+                x: cx + CAP_PATROL_STANDOFF * Math.cos(angle),
+                y: cy + CAP_PATROL_STANDOFF * Math.sin(angle),
+            });
+        }
+        return route;
+    }
+
+    const hull = convexHull(targetPoints);
+    const cx = hull.reduce((s, p) => s + p.x, 0) / hull.length;
+    const cy = hull.reduce((s, p) => s + p.y, 0) / hull.length;
+
+    return hull.map(p => {
+        const dx = p.x - cx;
+        const dy = p.y - cy;
         const dist = Math.sqrt(dx * dx + dy * dy) || 1;
-        return { x: t.x + (dx / dist) * CAP_PATROL_STANDOFF, y: t.y + (dy / dist) * CAP_PATROL_STANDOFF };
+        return {
+            x: p.x + (dx / dist) * CAP_PATROL_STANDOFF,
+            y: p.y + (dy / dist) * CAP_PATROL_STANDOFF,
+        };
     });
 }
 
@@ -858,6 +957,7 @@ export function resetSimulation(): void {
     isInitialized.set(false);
     isRunning.set(false);
     pathMode.set(false);
+    targets.set(generateTargets());
     // Don't clear currentPath/activeRoute here - they persist across resets in route mode
 }
 
@@ -931,4 +1031,126 @@ export function formationCommand(command: 'hold' | 'advance' | 'disperse' | 'con
 
 export function updateFormation(): void {
     manager?.updateFormation();
+}
+
+// ========================================================================
+// Rust-side Strategy Management
+// ========================================================================
+
+export function setGroupStrategy(group: 0 | 1, strategy: StrategyType): void {
+    if (!manager) return;
+
+    // Remove RL agents for both groups (strategies are all cleared and re-applied)
+    manager.removeRlAgent(0);
+    manager.removeRlAgent(1);
+
+    // First clear existing strategies (they'll be re-applied)
+    manager.clearStrategies();
+
+    // Update stores
+    if (group === 0) groupAStrategy.set(strategy);
+    else groupBStrategy.set(strategy);
+
+    // Read both group strategies
+    const stratA = group === 0 ? strategy : get(groupAStrategy);
+    const stratB = group === 1 ? strategy : get(groupBStrategy);
+
+    // Apply both strategies (clear_strategies removes all, so we re-apply both)
+    applyStrategy(0, stratA);
+    applyStrategy(1, stratB);
+
+    updateRenderState();
+}
+
+function applyStrategy(group: 0 | 1, strategy: StrategyType): void {
+    if (!manager || strategy === 'none') return;
+
+    const drones = manager.getRenderState();
+    const currentTargets = get(targets);
+
+    // Get drone IDs for this group
+    const groupDrones = group === 0
+        ? drones.filter(d => d.id < groupSplitId)
+        : drones.filter(d => d.id >= groupSplitId);
+    const droneIds = groupDrones.map(d => d.id);
+    if (droneIds.length === 0) return;
+
+    // Determine center and radius from friendly targets
+    const friendlyGroup = group === 0 ? 'a' : 'b';
+    const friendlyTargets = currentTargets.filter(t => t.group === friendlyGroup && !t.destroyed);
+    const enemyGroup = group === 0 ? 'b' : 'a';
+    const enemyTargets = currentTargets.filter(t => t.group === enemyGroup && !t.destroyed);
+
+    // Center defaults to cluster center if no targets
+    const center = friendlyTargets.length > 0
+        ? {
+            x: friendlyTargets.reduce((s, t) => s + t.x, 0) / friendlyTargets.length,
+            y: friendlyTargets.reduce((s, t) => s + t.y, 0) / friendlyTargets.length,
+        }
+        : group === 0 ? { x: 840, y: 800 } : { x: 3240, y: 3200 };
+
+    switch (strategy) {
+        case 'defend_area':
+            manager.setStrategyDefendArea(droneIds, center.x, center.y, 600);
+            break;
+        case 'attack_zone': {
+            // Attack enemy targets — pass their positions directly
+            const targetPositions = enemyTargets.map(t => ({ x: t.x, y: t.y }));
+            if (targetPositions.length === 0) break;
+            manager.setStrategyAttackZone(droneIds, targetPositions);
+            break;
+        }
+        case 'patrol_perimeter': {
+            // Build patrol perimeter around the group's friendly targets
+            const patrolWaypoints = friendlyTargets.length > 0
+                ? buildPatrolRoute(friendlyTargets)
+                : (group === 0 ? ROUTE_A : ROUTE_B);
+            manager.setStrategyPatrolPerimeter(droneIds, patrolWaypoints, 0.0);
+            break;
+        }
+        case 'doctrine_aggressive':
+        case 'doctrine_defensive': {
+            // Autonomous force allocation: doctrine manages defense + offense
+            const patrolWaypoints = friendlyTargets.length > 0
+                ? buildPatrolRoute(friendlyTargets)
+                : (group === 0 ? ROUTE_A : ROUTE_B);
+            const friendlyPositions = friendlyTargets.map(t => ({ x: t.x, y: t.y }));
+            const enemyPositions = enemyTargets.map(t => ({ x: t.x, y: t.y }));
+            const mode = strategy === 'doctrine_aggressive' ? 'aggressive' : 'defensive';
+            manager.setDoctrine(droneIds, friendlyPositions, enemyPositions, patrolWaypoints, mode);
+            break;
+        }
+        case 'doctrine_rl': {
+            // Set up doctrine with defensive as base mode, then load RL model on top
+            const patrolWaypoints = friendlyTargets.length > 0
+                ? buildPatrolRoute(friendlyTargets)
+                : (group === 0 ? ROUTE_A : ROUTE_B);
+            const friendlyPositions = friendlyTargets.map(t => ({ x: t.x, y: t.y }));
+            const enemyPositions = enemyTargets.map(t => ({ x: t.x, y: t.y }));
+            manager.setDoctrine(droneIds, friendlyPositions, enemyPositions, patrolWaypoints, 'defensive');
+
+            // Load RL model asynchronously
+            const otherGroup = group === 0 ? 'b' : 'a';
+            const initialOwnDrones = droneIds.length;
+            const otherDrones = drones.filter(d =>
+                group === 0 ? d.id >= groupSplitId : d.id < groupSplitId
+            );
+            const initialEnemyDrones = otherDrones.length;
+
+            loadRlModelJson().then(modelJson => {
+                if (!manager) return;
+                manager.loadRlModelMulti(
+                    group,
+                    modelJson,
+                    initialOwnDrones,
+                    initialEnemyDrones,
+                    friendlyTargets.length,
+                    enemyTargets.length,
+                );
+            }).catch(err => {
+                console.error('Failed to load RL model:', err);
+            });
+            break;
+        }
+    }
 }

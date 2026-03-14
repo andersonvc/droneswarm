@@ -1,7 +1,7 @@
 <script lang="ts">
     import { status, setSpeed } from '$lib/stores/simulation';
 
-    const speeds = [1, 2, 4, 8, 16];
+    const speeds = [4, 8, 16, 24];
 
     function handleChange(e: Event) {
         const index = parseInt((e.target as HTMLInputElement).value, 10);
@@ -17,7 +17,7 @@
         id="speed"
         type="range"
         min="0"
-        max="4"
+        max="3"
         step="1"
         value={currentIndex >= 0 ? currentIndex : 2}
         oninput={handleChange}

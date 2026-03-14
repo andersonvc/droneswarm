@@ -21,6 +21,7 @@ pub mod conditions;
 pub mod factory;
 pub mod orca;
 pub mod potential_field;
+pub mod safety;
 pub mod separation;
 pub mod tree;
 pub mod velocity_obstacle;

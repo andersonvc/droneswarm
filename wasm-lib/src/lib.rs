@@ -4,8 +4,22 @@ use std::sync::Arc;
 use drone_lib::DroneAgent;
 use drone_lib::{
     APFConfig, Bounds as LibBounds, DroneInfo, DronePerfFeatures, FormationApproachMode,
-    FormationCommand, FormationSlot, FormationType, Heading, Objective, PathPlanner, Position, Vec2,
+    FormationCommand, FormationSlot, FormationType, Heading, Objective, PathPlanner, Position,
+    TaskStatus, Vec2,
 };
+use drone_lib::doctrine::{DoctrineMode, SwarmDoctrine};
+use drone_lib::inference::InferenceNet;
+use drone_lib::strategies::attack_zone::AttackZoneStrategy;
+use drone_lib::strategies::defend_area::DefendAreaStrategy;
+use drone_lib::strategies::patrol_perimeter::PatrolPerimeterStrategy;
+use drone_lib::strategies::{StrategyDroneState, SwarmStrategy, TaskAssignment};
+use drone_lib::tasks::attack::AttackTask;
+use drone_lib::tasks::defend::DefendTask;
+use drone_lib::tasks::evade::EvadeTask;
+use drone_lib::tasks::intercept::InterceptTask;
+use drone_lib::tasks::intercept_group::InterceptGroupTask;
+use drone_lib::tasks::loiter::LoiterTask;
+use drone_lib::tasks::patrol::PatrolTask;
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
 
@@ -265,6 +279,51 @@ const DRONE_LENGTH_METERS: f32 = 37.5;
 /// Detonation blast radius = 5x drone length
 const DETONATION_RADIUS: f32 = DRONE_LENGTH_METERS * 5.0;
 
+/// RL agent state for a single group.
+struct RlAgentState {
+    /// Trained policy network.
+    model: InferenceNet,
+    /// Which group this agent controls (0 or 1).
+    group: u32,
+    /// Whether the agent is actively making decisions.
+    enabled: bool,
+    /// Tick counter for decision frequency.
+    tick_counter: u32,
+    /// Initial drone count for observation normalization.
+    initial_own_drones: f32,
+    /// Initial enemy drone count for observation normalization.
+    initial_enemy_drones: f32,
+    /// Initial friendly target count.
+    initial_friendly_targets: f32,
+    /// Initial enemy target count.
+    initial_enemy_targets: f32,
+    /// Current friendly target count (updated externally).
+    current_friendly_targets: f32,
+    /// Current enemy target count (updated externally).
+    current_enemy_targets: f32,
+    /// Multi-agent mode: per-drone inference instead of doctrine-level.
+    multi_agent: bool,
+}
+
+/// How often the RL agent makes decisions (in ticks).
+const RL_DECISION_INTERVAL: u32 = 60;
+/// How often the multi-agent RL makes decisions (in ticks).
+const RL_MULTI_DECISION_INTERVAL: u32 = 20;
+/// Max simulation ticks for observation normalization.
+const RL_MAX_TICKS: f32 = 10000.0;
+/// Max nearby threats for observation normalization.
+const RL_MAX_NEARBY_THREATS: f32 = 20.0;
+/// Threat detection radius multiplier (relative to DETONATION_RADIUS).
+const RL_THREAT_RADIUS_MULTIPLIER: f32 = 5.0;
+/// Max drone velocity for per-drone obs normalization.
+const RL_MAX_VELOCITY: f32 = 20.0;
+/// Per-drone observation dimensionality.
+const RL_OBS_DIM: usize = 64;
+/// Per-drone action dimensionality.
+const RL_ACT_DIM: usize = 14;
+/// Patrol standoff distance for RL patrol action.
+const RL_PATROL_STANDOFF: f32 = 200.0;
+
 pub struct Swarm {
     drones: Vec<DroneState>,
     /// Drone IDs queued for detonation (processed next tick)
@@ -287,6 +346,12 @@ pub struct Swarm {
     selected_ids: HashSet<u32>,
     consensus_protocol: ConsensusProtocol,
     formations: Vec<FormationState>,
+    /// Active swarm-level strategies.
+    strategies: Vec<Box<dyn SwarmStrategy>>,
+    /// RL agents (one per group, if loaded).
+    rl_agents: Vec<RlAgentState>,
+    /// Last RL action per drone (for observation encoding).
+    rl_last_actions: HashMap<u32, u32>,
 }
 
 impl Swarm {
@@ -351,6 +416,9 @@ impl Swarm {
             selected_ids: HashSet::new(),
             consensus_protocol: ConsensusProtocol::default(),
             formations: Vec::new(),
+            strategies: Vec::new(),
+            rl_agents: Vec::new(),
+            rl_last_actions: HashMap::new(),
         };
 
         Ok(swarm)
@@ -504,101 +572,71 @@ impl Swarm {
             swarm_info[idx] = self.drones[idx].agent.get_info();
         }
 
-        // Process intercept drones: update waypoint to follow target drone each tick
-        if !self.intercept_targets.is_empty() {
-            // Collect target positions first (borrow checker)
-            let target_positions: HashMap<u32, Position> = self.intercept_targets.iter()
-                .filter_map(|(&attacker_id, &target_id)| {
-                    self.drones.iter()
-                        .find(|d| d.id == target_id)
-                        .map(|d| (attacker_id, d.agent.state().pos))
-                })
-                .collect();
+        // Process task-based drones: check for detonation requests and task completion
+        {
+            let mut task_detonations: Vec<u32> = Vec::new();
+            let mut task_completed: Vec<u32> = Vec::new();
+            let mut task_failed: Vec<u32> = Vec::new();
 
-            let mut intercept_detonated: Vec<u32> = Vec::new();
-            let mut intercept_orphaned: Vec<u32> = Vec::new();
-            let mut intercept_abort: Vec<u32> = Vec::new();
+            for drone in &self.drones {
+                let id = drone.id;
 
-            for (&attacker_id, &_target_id) in &self.intercept_targets {
-                if let Some(&target_pos) = target_positions.get(&attacker_id) {
-                    // Update interceptor's waypoint to target's current position
-                    if let Some(drone) = self.drones.iter_mut().find(|d| d.id == attacker_id) {
+                // Check if task requested detonation
+                if drone.agent.should_detonate() {
+                    // For intercept drones, check protected zone safety
+                    if self.intercept_targets.contains_key(&id) {
                         let drone_pos = drone.agent.state().pos;
-
-                        // Check if within detonation range of target
-                        let dist = self.lib_bounds.distance(
-                            drone_pos.as_vec2(),
-                            target_pos.as_vec2(),
-                        );
-                        if dist <= DETONATION_RADIUS {
-                            // Before detonating, check if blast would hit a friendly target
-                            let group = if attacker_id < self.group_split_id { 0 } else { 1 };
-                            let would_hit_friendly = self.protected_zones
-                                .get(&group)
-                                .map(|zones| {
-                                    zones.iter().any(|z| {
-                                        self.lib_bounds.distance(drone_pos.as_vec2(), z.as_vec2())
-                                            <= DETONATION_RADIUS
-                                    })
+                        let group = if id < self.group_split_id { 0 } else { 1 };
+                        let would_hit_friendly = self.protected_zones
+                            .get(&group)
+                            .map(|zones| {
+                                zones.iter().any(|z| {
+                                    self.lib_bounds.distance(drone_pos.as_vec2(), z.as_vec2())
+                                        <= DETONATION_RADIUS
                                 })
-                                .unwrap_or(false);
+                            })
+                            .unwrap_or(false);
 
-                            if would_hit_friendly {
-                                // Abort: don't detonate, disengage
-                                intercept_abort.push(attacker_id);
-                            } else {
-                                intercept_detonated.push(attacker_id);
-                            }
-                        } else {
-                            // Not in range yet — keep chasing
-                            let mut waypoints = VecDeque::new();
-                            waypoints.push_back(target_pos);
-                            drone.agent.set_objective(Objective::ReachWaypoint { waypoints });
+                        if would_hit_friendly {
+                            // Abort — too close to friendly
+                            task_failed.push(id);
+                            continue;
                         }
                     }
-                } else {
-                    // Target drone no longer exists — orphaned interceptor
-                    intercept_orphaned.push(attacker_id);
+                    task_detonations.push(id);
+                    continue;
                 }
-            }
 
-            for id in &intercept_detonated {
-                self.intercept_targets.remove(id);
-                self.pending_detonations.insert(*id);
-            }
-            // Orphaned interceptors: target destroyed, stop intercepting
-            for id in &intercept_orphaned {
-                self.intercept_targets.remove(id);
-                if let Some(drone) = self.drones.iter_mut().find(|d| d.id == *id) {
-                    drone.agent.set_objective(Objective::Sleep);
-                }
-            }
-            // Aborted interceptors: too close to friendly target, disengage
-            for id in &intercept_abort {
-                self.intercept_targets.remove(id);
-                if let Some(drone) = self.drones.iter_mut().find(|d| d.id == *id) {
-                    drone.agent.set_objective(Objective::Sleep);
-                }
-            }
-        }
-
-        // Check attack-mode drones: auto-detonate when within blast radius of target
-        if !self.attack_targets.is_empty() {
-            let mut arrived: Vec<u32> = Vec::new();
-            for (&drone_id, &target_pos) in &self.attack_targets {
-                if let Some(drone) = self.drones.iter().find(|d| d.id == drone_id) {
-                    let drone_pos = drone.agent.state().pos;
-                    let dist = self.lib_bounds.distance(
-                        drone_pos.as_vec2(), target_pos.as_vec2()
-                    );
-                    if dist <= DETONATION_RADIUS {
-                        arrived.push(drone_id);
+                // Check for task completion/failure without detonation
+                if let Some(status) = drone.agent.task_status() {
+                    match status {
+                        TaskStatus::Complete => task_completed.push(id),
+                        TaskStatus::Failed => task_failed.push(id),
+                        TaskStatus::Active => {}
                     }
                 }
             }
-            for id in arrived {
-                self.attack_targets.remove(&id);
-                self.pending_detonations.insert(id);
+
+            for id in &task_detonations {
+                self.intercept_targets.remove(id);
+                self.attack_targets.remove(id);
+                self.pending_detonations.insert(*id);
+            }
+            for id in &task_completed {
+                self.intercept_targets.remove(id);
+                self.attack_targets.remove(id);
+                if let Some(drone) = self.drones.iter_mut().find(|d| d.id == *id) {
+                    drone.agent.clear_task();
+                    drone.agent.set_objective(Objective::Sleep);
+                }
+            }
+            for id in &task_failed {
+                self.intercept_targets.remove(id);
+                self.attack_targets.remove(id);
+                if let Some(drone) = self.drones.iter_mut().find(|d| d.id == *id) {
+                    drone.agent.clear_task();
+                    drone.agent.set_objective(Objective::Sleep);
+                }
             }
         }
 
@@ -684,7 +722,210 @@ impl Swarm {
             self.check_leader_successions(saved_routes);
         }
 
+        // Process swarm strategies — after all deaths and cleanup,
+        // strategies see clean state and produce task assignments for next tick.
+        if !self.strategies.is_empty() {
+            let swarm_info: Vec<DroneInfo> = self.drones.iter()
+                .map(|d| d.agent.get_info())
+                .collect();
+            self.process_strategies(&swarm_info, effective_dt);
+        }
+
+        // RL agent decisions (modifies doctrine mode).
+        if !self.rl_agents.is_empty() {
+            self.tick_rl_agents();
+        }
+
         self.simulation_time += effective_dt;
+    }
+
+    /// Process active strategies: build drone states, tick each strategy,
+    /// apply returned task assignments, and remove completed strategies.
+    fn process_strategies(&mut self, swarm_info: &[DroneInfo], dt: f32) {
+        let mut all_assignments: Vec<TaskAssignment> = Vec::new();
+        let bounds = self.lib_bounds;
+        let drones = &self.drones;
+
+        for strategy in &mut self.strategies {
+            let own_drones: Vec<StrategyDroneState> = strategy
+                .drone_ids()
+                .iter()
+                .filter_map(|&id| {
+                    drones.iter().find(|d| d.id == id as u32).map(|d| {
+                        let available = match d.agent.task_status() {
+                            None => true,
+                            Some(TaskStatus::Active) => false,
+                            Some(TaskStatus::Complete) | Some(TaskStatus::Failed) => true,
+                        };
+                        StrategyDroneState {
+                            id,
+                            pos: d.agent.state().pos,
+                            vel: d.agent.state().vel,
+                            available,
+                        }
+                    })
+                })
+                .collect();
+
+            let assignments = strategy.tick(&own_drones, swarm_info, &bounds, dt);
+            all_assignments.extend(assignments);
+        }
+
+        for assignment in all_assignments {
+            self.apply_task_assignment(assignment);
+        }
+
+        self.strategies.retain(|s| !s.is_complete());
+    }
+
+    /// Apply a task assignment from a strategy to a drone.
+    fn apply_task_assignment(&mut self, assignment: TaskAssignment) {
+        // PatrolFormation is handled specially — it manages a group, not a single drone
+        if let TaskAssignment::PatrolFormation {
+            leader_id,
+            follower_ids,
+            waypoints,
+            loiter_duration,
+        } = assignment
+        {
+            self.apply_patrol_formation(leader_id, follower_ids, waypoints, loiter_duration);
+            return;
+        }
+
+        // Extract drone_id for cleanup
+        let drone_id_u32 = match &assignment {
+            TaskAssignment::Intercept { drone_id, .. }
+            | TaskAssignment::InterceptGroup { drone_id, .. }
+            | TaskAssignment::Attack { drone_id, .. }
+            | TaskAssignment::Defend { drone_id, .. }
+            | TaskAssignment::Patrol { drone_id, .. }
+            | TaskAssignment::Loiter { drone_id, .. } => *drone_id as u32,
+            TaskAssignment::PatrolFormation { .. } => unreachable!(),
+        };
+
+        // Clean up old tracking
+        self.attack_targets.remove(&drone_id_u32);
+        self.intercept_targets.remove(&drone_id_u32);
+
+        match assignment {
+            TaskAssignment::Intercept {
+                drone_id,
+                target_id,
+            } => {
+                self.intercept_drone(drone_id as u32, target_id as u32);
+            }
+            TaskAssignment::InterceptGroup { drone_id } => {
+                let id = drone_id as u32;
+                self.remove_drone_from_formation(id);
+                let group = if id < self.group_split_id { 0 } else { 1 };
+                if let Some(drone) = self.drones.iter_mut().find(|d| d.id == id) {
+                    let task = drone_lib::tasks::intercept_group::InterceptGroupTask::new(
+                        group,
+                        DETONATION_RADIUS,
+                    );
+                    drone.agent.set_task(Box::new(task));
+                }
+            }
+            TaskAssignment::Attack { drone_id, target } => {
+                let id = drone_id as u32;
+                self.remove_drone_from_formation(id);
+                if let Some(drone) = self.drones.iter_mut().find(|d| d.id == id) {
+                    let task = AttackTask::new(target, DETONATION_RADIUS);
+                    drone.agent.set_task(Box::new(task));
+                }
+                self.attack_targets.insert(id, target);
+            }
+            TaskAssignment::Defend {
+                drone_id,
+                center,
+                orbit_radius,
+                engage_radius,
+            } => {
+                let id = drone_id as u32;
+                self.remove_drone_from_formation(id);
+                let group = if id < self.group_split_id { 0 } else { 1 };
+                if let Some(drone) = self.drones.iter_mut().find(|d| d.id == id) {
+                    let task = DefendTask::new(
+                        drone_id,
+                        group,
+                        center,
+                        orbit_radius,
+                        engage_radius,
+                        DETONATION_RADIUS,
+                    );
+                    drone.agent.set_task(Box::new(task));
+                }
+            }
+            TaskAssignment::Patrol {
+                drone_id,
+                waypoints,
+                loiter_duration,
+            } => {
+                let id = drone_id as u32;
+                self.remove_drone_from_formation(id);
+                if let Some(drone) = self.drones.iter_mut().find(|d| d.id == id) {
+                    let task = PatrolTask::new(waypoints, 50.0, loiter_duration);
+                    drone.agent.set_task(Box::new(task));
+                }
+            }
+            TaskAssignment::Loiter { drone_id, position } => {
+                let id = drone_id as u32;
+                self.remove_drone_from_formation(id);
+                if let Some(drone) = self.drones.iter_mut().find(|d| d.id == id) {
+                    let task = LoiterTask::new(position, 50.0);
+                    drone.agent.set_task(Box::new(task));
+                }
+            }
+            TaskAssignment::PatrolFormation { .. } => unreachable!("handled above"),
+        }
+    }
+
+    /// Set up a patrol formation squad: create a chevron formation for the
+    /// squad and assign the leader a patrol task. Followers automatically
+    /// maintain formation around the leader.
+    fn apply_patrol_formation(
+        &mut self,
+        leader_id: usize,
+        follower_ids: Vec<usize>,
+        waypoints: Vec<Position>,
+        loiter_duration: f32,
+    ) {
+        let leader_u32 = leader_id as u32;
+        let spacing_m = DETONATION_RADIUS * 1.2; // Keep drones > detonation radius apart
+
+        // Build the set of all drone IDs in this squad
+        let mut group_ids: HashSet<u32> = HashSet::new();
+        group_ids.insert(leader_u32);
+        for &fid in &follower_ids {
+            group_ids.insert(fid as u32);
+        }
+
+        // Remove all squad drones from existing formations and tracking
+        for &id in &group_ids {
+            self.remove_drone_from_formation(id);
+            self.attack_targets.remove(&id);
+            self.intercept_targets.remove(&id);
+        }
+
+        // Clear any existing task on followers (they'll follow via formation)
+        for &fid in &follower_ids {
+            if let Some(drone) = self.drones.iter_mut().find(|d| d.id == fid as u32) {
+                drone.agent.clear_task();
+            }
+        }
+
+        // Give leader the patrol task
+        if let Some(leader) = self.drones.iter_mut().find(|d| d.id == leader_u32) {
+            let task = PatrolTask::new(waypoints, 50.0, loiter_duration);
+            leader.agent.set_task(Box::new(task));
+        }
+
+        // Create chevron formation for the squad
+        let formation_type = FormationType::Chevron {
+            spacing: spacing_m,
+            angle: std::f32::consts::FRAC_PI_4,
+        };
+        self.set_formation_for_group(formation_type, group_ids, Some(leader_id));
     }
 
     // ========================================================================
@@ -872,7 +1113,7 @@ impl Swarm {
     }
 
     /// Assign a drone to attack a target position (in pixels).
-    /// The drone navigates to the target and auto-detonates when within blast radius.
+    /// Uses the AttackTask state machine — navigates at full speed and detonates on arrival.
     pub fn attack_target(&mut self, drone_id: u32, target_x: f32, target_y: f32) {
         let target_m = Position::new(
             self.world_scale.px_to_meters(target_x),
@@ -882,20 +1123,18 @@ impl Swarm {
         // Remove from formation (promotes new leader if needed)
         self.remove_drone_from_formation(drone_id);
 
-        // Set drone to navigate to the target
+        // Set up AttackTask on the drone agent
         if let Some(drone) = self.drones.iter_mut().find(|d| d.id == drone_id) {
-            let mut waypoints = VecDeque::new();
-            waypoints.push_back(target_m);
-            drone.agent.set_objective(Objective::ReachWaypoint { waypoints });
+            let task = AttackTask::new(target_m, DETONATION_RADIUS);
+            drone.agent.set_task(Box::new(task));
         }
 
-        // Register for auto-detonation check
+        // Register for tracking (used for cleanup)
         self.attack_targets.insert(drone_id, target_m);
     }
 
     /// Assign a drone to intercept (chase) an enemy drone.
-    /// The interceptor updates its waypoint each tick to follow the target drone
-    /// and auto-detonates when within blast radius.
+    /// Uses the InterceptTask state machine for lead pursuit with evade/re-engage phases.
     pub fn intercept_drone(&mut self, attacker_id: u32, target_drone_id: u32) {
         // Don't intercept self
         if attacker_id == target_drone_id { return; }
@@ -906,23 +1145,243 @@ impl Swarm {
         // Remove from formation (promotes new leader if needed)
         self.remove_drone_from_formation(attacker_id);
 
-        // Set initial waypoint to target drone's current position
-        if let Some(target_pos) = self.drones.iter()
-            .find(|d| d.id == target_drone_id)
-            .map(|d| d.agent.state().pos)
-        {
-            if let Some(drone) = self.drones.iter_mut().find(|d| d.id == attacker_id) {
-                let mut waypoints = VecDeque::new();
-                waypoints.push_back(target_pos);
-                drone.agent.set_objective(Objective::ReachWaypoint { waypoints });
-            }
+        // Determine attacker's group
+        let group = if attacker_id < self.group_split_id { 0 } else { 1 };
+
+        // Set up InterceptTask on the drone agent
+        if let Some(drone) = self.drones.iter_mut().find(|d| d.id == attacker_id) {
+            let task = InterceptTask::new(
+                attacker_id as usize,
+                target_drone_id as usize,
+                group,
+                DETONATION_RADIUS,
+            );
+            drone.agent.set_task(Box::new(task));
         }
 
         // Remove from attack_targets if it was there
         self.attack_targets.remove(&attacker_id);
-        // Register for intercept tracking
+        // Register for intercept tracking (used for cleanup and protected zone checks)
         self.intercept_targets.insert(attacker_id, target_drone_id);
     }
+
+    /// Assign a drone to loiter (hold position) at a target position (in pixels).
+    pub fn loiter_at(&mut self, drone_id: u32, target_x: f32, target_y: f32) {
+        let target_m = Position::new(
+            self.world_scale.px_to_meters(target_x),
+            self.world_scale.px_to_meters(target_y),
+        );
+
+        self.remove_drone_from_formation(drone_id);
+        self.attack_targets.remove(&drone_id);
+        self.intercept_targets.remove(&drone_id);
+
+        if let Some(drone) = self.drones.iter_mut().find(|d| d.id == drone_id) {
+            let task = LoiterTask::new(target_m, 50.0);
+            drone.agent.set_task(Box::new(task));
+        }
+    }
+
+    /// Assign a drone to patrol a route of waypoints (in pixels).
+    /// `loiter_duration` is how many seconds to hold at each waypoint.
+    pub fn patrol_route(&mut self, drone_id: u32, waypoints_px: &[Point], loiter_duration: f32) {
+        if waypoints_px.is_empty() { return; }
+
+        self.remove_drone_from_formation(drone_id);
+        self.attack_targets.remove(&drone_id);
+        self.intercept_targets.remove(&drone_id);
+
+        let waypoints: Vec<Position> = waypoints_px.iter()
+            .map(|p| Position::new(
+                self.world_scale.px_to_meters(p.x),
+                self.world_scale.px_to_meters(p.y),
+            ))
+            .collect();
+
+        if let Some(drone) = self.drones.iter_mut().find(|d| d.id == drone_id) {
+            let task = PatrolTask::new(waypoints, 50.0, loiter_duration);
+            drone.agent.set_task(Box::new(task));
+        }
+    }
+
+    /// Assign a drone to defend a position (in pixels).
+    /// The drone orbits the position and engages enemies that enter the zone.
+    pub fn defend_position(
+        &mut self,
+        drone_id: u32,
+        center_x: f32,
+        center_y: f32,
+        orbit_radius_px: f32,
+        engage_radius_px: f32,
+    ) {
+        let center_m = Position::new(
+            self.world_scale.px_to_meters(center_x),
+            self.world_scale.px_to_meters(center_y),
+        );
+        let orbit_radius = self.world_scale.px_to_meters(orbit_radius_px);
+        let engage_radius = self.world_scale.px_to_meters(engage_radius_px);
+
+        self.remove_drone_from_formation(drone_id);
+        self.attack_targets.remove(&drone_id);
+        self.intercept_targets.remove(&drone_id);
+
+        let group = if drone_id < self.group_split_id { 0 } else { 1 };
+
+        if let Some(drone) = self.drones.iter_mut().find(|d| d.id == drone_id) {
+            let task = DefendTask::new(
+                drone_id as usize,
+                group,
+                center_m,
+                orbit_radius,
+                engage_radius,
+                DETONATION_RADIUS,
+            );
+            drone.agent.set_task(Box::new(task));
+        }
+    }
+
+    // ========================================================================
+    // Strategy Commands
+    // ========================================================================
+
+    /// Set a defend area strategy for a group of drones.
+    /// Positions in pixels, converted to meters internally.
+    pub fn set_strategy_defend_area(
+        &mut self,
+        drone_ids: &[u32],
+        center_x: f32,
+        center_y: f32,
+        radius: f32,
+    ) {
+        let center = Position::new(
+            self.world_scale.px_to_meters(center_x),
+            self.world_scale.px_to_meters(center_y),
+        );
+        let radius_m = self.world_scale.px_to_meters(radius);
+        let group = drone_ids
+            .first()
+            .map(|&id| if id < self.group_split_id { 0 } else { 1 })
+            .unwrap_or(0);
+        let ids: Vec<usize> = drone_ids.iter().map(|&id| id as usize).collect();
+
+        let strategy = DefendAreaStrategy::new(ids, group, center, radius_m, DETONATION_RADIUS);
+        self.strategies.push(Box::new(strategy));
+    }
+
+    /// Set an attack zone strategy for a group of drones.
+    /// Target positions in pixels, converted to meters internally.
+    pub fn set_strategy_attack_zone(
+        &mut self,
+        drone_ids: &[u32],
+        target_positions_px: &[Point],
+    ) {
+        let target_positions: Vec<Position> = target_positions_px
+            .iter()
+            .map(|p| {
+                Position::new(
+                    self.world_scale.px_to_meters(p.x),
+                    self.world_scale.px_to_meters(p.y),
+                )
+            })
+            .collect();
+        let ids: Vec<usize> = drone_ids.iter().map(|&id| id as usize).collect();
+
+        let strategy = AttackZoneStrategy::new(ids, target_positions, DETONATION_RADIUS);
+        self.strategies.push(Box::new(strategy));
+    }
+
+    /// Set a patrol perimeter strategy for a group of drones.
+    /// Waypoints in pixels, converted to meters internally.
+    pub fn set_strategy_patrol_perimeter(
+        &mut self,
+        drone_ids: &[u32],
+        waypoints_px: &[Point],
+        loiter_duration: f32,
+    ) {
+        let waypoints: Vec<Position> = waypoints_px
+            .iter()
+            .map(|p| {
+                Position::new(
+                    self.world_scale.px_to_meters(p.x),
+                    self.world_scale.px_to_meters(p.y),
+                )
+            })
+            .collect();
+        let group = drone_ids
+            .first()
+            .map(|&id| if id < self.group_split_id { 0 } else { 1 })
+            .unwrap_or(0);
+        let ids: Vec<usize> = drone_ids.iter().map(|&id| id as usize).collect();
+
+        let strategy = PatrolPerimeterStrategy::new(ids, waypoints, loiter_duration, group, DETONATION_RADIUS);
+        self.strategies.push(Box::new(strategy));
+    }
+
+    /// Remove all active strategies.
+    pub fn clear_strategies(&mut self) {
+        self.strategies.clear();
+    }
+
+    /// Set a doctrine (autonomous force allocation) for a group of drones.
+    /// Positions in pixels, converted to meters internally.
+    /// `mode`: "aggressive" or "defensive".
+    pub fn set_doctrine(
+        &mut self,
+        drone_ids: &[u32],
+        friendly_targets_px: &[Point],
+        enemy_targets_px: &[Point],
+        patrol_waypoints_px: &[Point],
+        mode: DoctrineMode,
+    ) {
+        let group = drone_ids
+            .first()
+            .map(|&id| if id < self.group_split_id { 0 } else { 1 })
+            .unwrap_or(0);
+        let ids: Vec<usize> = drone_ids.iter().map(|&id| id as usize).collect();
+        let friendly: Vec<Position> = friendly_targets_px
+            .iter()
+            .map(|p| self.world_scale.point_px_to_position(*p))
+            .collect();
+        let enemy: Vec<Position> = enemy_targets_px
+            .iter()
+            .map(|p| self.world_scale.point_px_to_position(*p))
+            .collect();
+        let waypoints: Vec<Position> = patrol_waypoints_px
+            .iter()
+            .map(|p| self.world_scale.point_px_to_position(*p))
+            .collect();
+
+        let doctrine = SwarmDoctrine::new(ids, group, friendly, enemy, waypoints, DETONATION_RADIUS, mode);
+        self.strategies.push(Box::new(doctrine));
+    }
+
+    /// Update target positions for all doctrine strategies belonging to a group.
+    /// Called when targets are destroyed/changed during gameplay.
+    pub fn update_doctrine_targets(
+        &mut self,
+        group: u32,
+        friendly_targets_px: &[Point],
+        enemy_targets_px: &[Point],
+    ) {
+        let friendly: Vec<Position> = friendly_targets_px
+            .iter()
+            .map(|p| self.world_scale.point_px_to_position(*p))
+            .collect();
+        let enemy: Vec<Position> = enemy_targets_px
+            .iter()
+            .map(|p| self.world_scale.point_px_to_position(*p))
+            .collect();
+
+        for strategy in &mut self.strategies {
+            if strategy.group() == Some(group) {
+                strategy.update_targets(&friendly, &enemy);
+            }
+        }
+    }
+
+    // ========================================================================
+    // Formation / Return Commands
+    // ========================================================================
 
     /// Return a drone to its original formation group.
     /// Re-adds it to the formation's drone_ids, recomputes slots, and clears
@@ -930,9 +1389,12 @@ impl Swarm {
     pub fn return_to_formation(&mut self, drone_id: u32, group_start: u32, group_end: u32) {
         if !self.drones.iter().any(|d| d.id == drone_id) { return; }
 
-        // Clear from attack/intercept tracking
+        // Clear from attack/intercept tracking and clear active task
         self.attack_targets.remove(&drone_id);
         self.intercept_targets.remove(&drone_id);
+        if let Some(drone) = self.drones.iter_mut().find(|d| d.id == drone_id) {
+            drone.agent.clear_task();
+        }
 
         // Find the formation for this group range
         let formation_idx = self.formations.iter().position(|f| {
@@ -1015,7 +1477,7 @@ impl Swarm {
             drone.agent.set_orca_config(orca_config);
 
             drone.agent.set_apf_config(APFConfig {
-                influence_distance: 150.0,
+                influence_distance: DETONATION_RADIUS * 1.2, // keep friendlies outside blast radius
                 repulsion_strength: 10000000.0,
                 min_distance: 35.0,
                 max_force: 80.0,
@@ -1033,6 +1495,652 @@ impl Swarm {
             .map(|p| self.world_scale.point_px_to_position(*p))
             .collect();
         self.protected_zones.insert(group, positions);
+    }
+
+    // ========================================================================
+    // RL Agent Integration
+    // ========================================================================
+
+    /// Load a trained RL model for a group.
+    pub fn load_rl_model(
+        &mut self,
+        group: u32,
+        model_json: &str,
+        initial_own_drones: f32,
+        initial_enemy_drones: f32,
+        initial_friendly_targets: f32,
+        initial_enemy_targets: f32,
+    ) -> Result<(), String> {
+        self.load_rl_model_inner(
+            group, model_json,
+            initial_own_drones, initial_enemy_drones,
+            initial_friendly_targets, initial_enemy_targets,
+            false,
+        )
+    }
+
+    /// Load a per-drone RL model (multi-agent mode) for a group.
+    pub fn load_rl_model_multi(
+        &mut self,
+        group: u32,
+        model_json: &str,
+        initial_own_drones: f32,
+        initial_enemy_drones: f32,
+        initial_friendly_targets: f32,
+        initial_enemy_targets: f32,
+    ) -> Result<(), String> {
+        self.load_rl_model_inner(
+            group, model_json,
+            initial_own_drones, initial_enemy_drones,
+            initial_friendly_targets, initial_enemy_targets,
+            true,
+        )
+    }
+
+    fn load_rl_model_inner(
+        &mut self,
+        group: u32,
+        model_json: &str,
+        initial_own_drones: f32,
+        initial_enemy_drones: f32,
+        initial_friendly_targets: f32,
+        initial_enemy_targets: f32,
+        multi_agent: bool,
+    ) -> Result<(), String> {
+        let model = InferenceNet::from_json(model_json)?;
+
+        // Remove any existing agent for this group.
+        self.rl_agents.retain(|a| a.group != group);
+
+        self.rl_agents.push(RlAgentState {
+            model,
+            group,
+            enabled: true,
+            tick_counter: 0,
+            initial_own_drones,
+            initial_enemy_drones,
+            initial_friendly_targets,
+            initial_enemy_targets,
+            current_friendly_targets: initial_friendly_targets,
+            current_enemy_targets: initial_enemy_targets,
+            multi_agent,
+        });
+
+        Ok(())
+    }
+
+    /// Enable or disable the RL agent for a group.
+    pub fn set_rl_agent_enabled(&mut self, group: u32, enabled: bool) {
+        for agent in &mut self.rl_agents {
+            if agent.group == group {
+                agent.enabled = enabled;
+                if enabled {
+                    agent.tick_counter = 0;
+                }
+            }
+        }
+    }
+
+    /// Update the RL agent's target counts (called when targets are destroyed).
+    pub fn update_rl_targets(
+        &mut self,
+        group: u32,
+        friendly_targets: f32,
+        enemy_targets: f32,
+    ) {
+        for agent in &mut self.rl_agents {
+            if agent.group == group {
+                agent.current_friendly_targets = friendly_targets;
+                agent.current_enemy_targets = enemy_targets;
+            }
+        }
+    }
+
+    /// Remove the RL agent for a group.
+    pub fn remove_rl_agent(&mut self, group: u32) {
+        self.rl_agents.retain(|a| a.group != group);
+    }
+
+    /// Tick all enabled RL agents.
+    fn tick_rl_agents(&mut self) {
+        // Check if any agent uses multi-agent mode.
+        let has_multi = self.rl_agents.iter().any(|a| a.enabled && a.multi_agent);
+        let has_doctrine = self.rl_agents.iter().any(|a| a.enabled && !a.multi_agent);
+
+        if has_multi {
+            self.tick_rl_agents_multi();
+        }
+        if has_doctrine {
+            self.tick_rl_agents_doctrine();
+        }
+    }
+
+    /// Tick doctrine-level RL agents (8-dim obs, 3 actions — legacy mode).
+    fn tick_rl_agents_doctrine(&mut self) {
+        let mut decisions: Vec<(u32, DoctrineMode)> = Vec::new();
+
+        for agent in &mut self.rl_agents {
+            if !agent.enabled || agent.multi_agent {
+                continue;
+            }
+            agent.tick_counter += 1;
+            if agent.tick_counter % RL_DECISION_INTERVAL != 0 {
+                continue;
+            }
+
+            let group = agent.group;
+            let other_group = if group == 0 { 1 } else { 0 };
+
+            let own_count = self.drones.iter()
+                .filter(|d| {
+                    if group == 0 { d.id < self.group_split_id }
+                    else { d.id >= self.group_split_id }
+                })
+                .count() as f32;
+            let enemy_count = self.drones.iter()
+                .filter(|d| {
+                    if other_group == 0 { d.id < self.group_split_id }
+                    else { d.id >= self.group_split_id }
+                })
+                .count() as f32;
+
+            let friendly_centroid = self.protected_zones
+                .get(&group)
+                .filter(|zones| !zones.is_empty())
+                .map(|zones| {
+                    let cx = zones.iter().map(|p| p.x()).sum::<f32>() / zones.len() as f32;
+                    let cy = zones.iter().map(|p| p.y()).sum::<f32>() / zones.len() as f32;
+                    (cx, cy)
+                });
+
+            let nearby_threats = if let Some((cx, cy)) = friendly_centroid {
+                let centroid = Vec2::new(cx, cy);
+                let threat_radius = DETONATION_RADIUS * RL_THREAT_RADIUS_MULTIPLIER;
+                self.drones.iter()
+                    .filter(|d| {
+                        let is_enemy = if other_group == 0 { d.id < self.group_split_id }
+                            else { d.id >= self.group_split_id };
+                        is_enemy && self.lib_bounds.distance(
+                            centroid,
+                            d.agent.state().pos.as_vec2(),
+                        ) <= threat_radius
+                    })
+                    .count() as f32
+            } else {
+                0.0
+            };
+
+            let (defend_frac, attack_frac) = self.strategies.iter()
+                .find(|s| s.group() == Some(group))
+                .and_then(|s| s.defend_attack_counts())
+                .map(|(d, a)| {
+                    let total = own_count;
+                    if total > 0.0 {
+                        (d as f32 / total, a as f32 / total)
+                    } else {
+                        (0.0, 0.0)
+                    }
+                })
+                .unwrap_or((0.5, 0.5));
+
+            let obs = [
+                (own_count / agent.initial_own_drones).clamp(0.0, 1.0),
+                (enemy_count / agent.initial_enemy_drones).clamp(0.0, 1.0),
+                (agent.current_friendly_targets / agent.initial_friendly_targets).clamp(0.0, 1.0),
+                (agent.current_enemy_targets / agent.initial_enemy_targets).clamp(0.0, 1.0),
+                (nearby_threats / RL_MAX_NEARBY_THREATS).clamp(0.0, 1.0),
+                (agent.tick_counter as f32 / RL_MAX_TICKS).clamp(0.0, 1.0),
+                defend_frac.clamp(0.0, 1.0),
+                attack_frac.clamp(0.0, 1.0),
+            ];
+
+            let action = agent.model.act(&obs);
+
+            match action {
+                0 => decisions.push((group, DoctrineMode::Aggressive)),
+                1 => decisions.push((group, DoctrineMode::Defensive)),
+                _ => {}
+            }
+        }
+
+        for (group, mode) in decisions {
+            for strategy in &mut self.strategies {
+                if strategy.group() == Some(group) {
+                    strategy.set_doctrine_mode(mode);
+                }
+            }
+        }
+    }
+
+    /// Tick multi-agent RL: per-drone observation + action.
+    fn tick_rl_agents_multi(&mut self) {
+        // Collect (drone_id, action) pairs to apply after loop.
+        let mut drone_actions: Vec<(u32, u32)> = Vec::new();
+
+        for agent in &mut self.rl_agents {
+            if !agent.enabled || !agent.multi_agent {
+                continue;
+            }
+            agent.tick_counter += 1;
+            if agent.tick_counter % RL_MULTI_DECISION_INTERVAL != 0 {
+                continue;
+            }
+
+            let group = agent.group;
+            let w = self.lib_bounds.width();
+            let diag = (w * w + w * w).sqrt();
+
+            // Get friendly and enemy target positions.
+            let friendly_targets: Vec<Position> = self.protected_zones
+                .get(&group)
+                .cloned()
+                .unwrap_or_default();
+            let other_group = if group == 0 { 1 } else { 0 };
+            let enemy_targets: Vec<Position> = self.protected_zones
+                .get(&other_group)
+                .cloned()
+                .unwrap_or_default();
+
+            // Global features.
+            let own_count = self.drones.iter()
+                .filter(|d| Self::drone_in_group(d.id, group, self.group_split_id))
+                .count() as f32;
+            let enemy_count = self.drones.iter()
+                .filter(|d| Self::drone_in_group(d.id, other_group, self.group_split_id))
+                .count() as f32;
+
+            let friendly_centroid = if !friendly_targets.is_empty() {
+                let cx = friendly_targets.iter().map(|p| p.x()).sum::<f32>() / friendly_targets.len() as f32;
+                let cy = friendly_targets.iter().map(|p| p.y()).sum::<f32>() / friendly_targets.len() as f32;
+                Some(Vec2::new(cx, cy))
+            } else {
+                None
+            };
+
+            let nearby_threats = if let Some(centroid) = friendly_centroid {
+                let threat_radius = DETONATION_RADIUS * RL_THREAT_RADIUS_MULTIPLIER;
+                self.drones.iter()
+                    .filter(|d| {
+                        Self::drone_in_group(d.id, other_group, self.group_split_id)
+                            && self.lib_bounds.distance(centroid, d.agent.state().pos.as_vec2()) <= threat_radius
+                    })
+                    .count() as f32
+            } else {
+                0.0
+            };
+
+            // For each alive drone in this agent's group, compute obs and act.
+            let drone_indices: Vec<usize> = self.drones.iter().enumerate()
+                .filter(|(_, d)| Self::drone_in_group(d.id, group, self.group_split_id))
+                .map(|(i, _)| i)
+                .collect();
+
+            for &drone_idx in &drone_indices {
+                let drone = &self.drones[drone_idx];
+                let state = drone.agent.state();
+                let my_pos = state.pos.as_vec2();
+
+                let mut obs = [0.0f32; RL_OBS_DIM];
+
+                // [0..5] Ego state
+                obs[0] = state.pos.x() / w;
+                obs[1] = state.pos.y() / w;
+                obs[2] = state.vel.as_vec2().x / RL_MAX_VELOCITY;
+                obs[3] = state.vel.as_vec2().y / RL_MAX_VELOCITY;
+                // Last action defaults to 13 (Hold) if no action has been recorded.
+                let last_action = self.rl_last_actions.get(&drone.id).copied().unwrap_or(13) as f32;
+                obs[4] = last_action / RL_ACT_DIM as f32;
+
+                // [5..25] 4 nearest enemy drones: (dx/w, dy/w, dist/diag, vx/max_v, vy/max_v) × 4
+                let mut enemies: Vec<(f32, f32, f32, f32, f32)> = self.drones.iter()
+                    .filter(|d| Self::drone_in_group(d.id, other_group, self.group_split_id))
+                    .map(|d| {
+                        let es = d.agent.state();
+                        let epos = es.pos.as_vec2();
+                        let dist = self.lib_bounds.distance(my_pos, epos);
+                        (
+                            (epos.x - my_pos.x) / w,
+                            (epos.y - my_pos.y) / w,
+                            dist / diag,
+                            es.vel.as_vec2().x / RL_MAX_VELOCITY,
+                            es.vel.as_vec2().y / RL_MAX_VELOCITY,
+                        )
+                    })
+                    .collect();
+                enemies.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap());
+
+                for i in 0..4 {
+                    let base = 5 + i * 5;
+                    if i < enemies.len() {
+                        let e = &enemies[i];
+                        obs[base] = e.0;
+                        obs[base + 1] = e.1;
+                        obs[base + 2] = e.2;
+                        obs[base + 3] = e.3;
+                        obs[base + 4] = e.4;
+                    } else {
+                        obs[base] = 1.0;
+                        obs[base + 1] = 1.0;
+                        obs[base + 2] = 1.0;
+                    }
+                }
+
+                // [25..40] 3 nearest friendly drones: (dx/w, dy/w, dist/diag, vx/max_v, vy/max_v) × 3
+                let mut friendlies: Vec<(f32, f32, f32, f32, f32)> = self.drones.iter()
+                    .filter(|d| Self::drone_in_group(d.id, group, self.group_split_id) && d.id != drone.id)
+                    .map(|d| {
+                        let fs = d.agent.state();
+                        let fpos = fs.pos.as_vec2();
+                        let dist = self.lib_bounds.distance(my_pos, fpos);
+                        (
+                            (fpos.x - my_pos.x) / w,
+                            (fpos.y - my_pos.y) / w,
+                            dist / diag,
+                            fs.vel.as_vec2().x / RL_MAX_VELOCITY,
+                            fs.vel.as_vec2().y / RL_MAX_VELOCITY,
+                        )
+                    })
+                    .collect();
+                friendlies.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap());
+
+                for i in 0..3 {
+                    let base = 25 + i * 5;
+                    if i < friendlies.len() {
+                        let f = &friendlies[i];
+                        obs[base] = f.0;
+                        obs[base + 1] = f.1;
+                        obs[base + 2] = f.2;
+                        obs[base + 3] = f.3;
+                        obs[base + 4] = f.4;
+                    } else {
+                        obs[base] = 1.0;
+                        obs[base + 1] = 1.0;
+                        obs[base + 2] = 1.0;
+                    }
+                }
+
+                // [40..46] 3 nearest enemy targets: (dx/w, dy/w) × 3
+                {
+                    let mut sorted_et: Vec<(&Position, f32)> = enemy_targets.iter()
+                        .map(|p| (p, self.lib_bounds.distance(my_pos, p.as_vec2())))
+                        .collect();
+                    sorted_et.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+                    for i in 0..3 {
+                        let base = 40 + i * 2;
+                        if i < sorted_et.len() {
+                            obs[base] = (sorted_et[i].0.x() - state.pos.x()) / w;
+                            obs[base + 1] = (sorted_et[i].0.y() - state.pos.y()) / w;
+                        }
+                    }
+                }
+
+                // [46..52] 3 nearest friendly targets: (dx/w, dy/w) × 3
+                {
+                    let mut sorted_ft: Vec<(&Position, f32)> = friendly_targets.iter()
+                        .map(|p| (p, self.lib_bounds.distance(my_pos, p.as_vec2())))
+                        .collect();
+                    sorted_ft.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+                    for i in 0..3 {
+                        let base = 46 + i * 2;
+                        if i < sorted_ft.len() {
+                            obs[base] = (sorted_ft[i].0.x() - state.pos.x()) / w;
+                            obs[base + 1] = (sorted_ft[i].0.y() - state.pos.y()) / w;
+                        }
+                    }
+                }
+
+                // [52..60] Global
+                obs[52] = own_count / agent.initial_own_drones;
+                obs[53] = enemy_count / agent.initial_enemy_drones;
+                obs[54] = (agent.current_friendly_targets / agent.initial_friendly_targets).clamp(0.0, 1.0);
+                obs[55] = (agent.current_enemy_targets / agent.initial_enemy_targets).clamp(0.0, 1.0);
+                obs[56] = (agent.tick_counter as f32 / RL_MAX_TICKS).clamp(0.0, 1.0);
+                obs[57] = (nearby_threats / RL_MAX_NEARBY_THREATS).clamp(0.0, 1.0);
+
+                // Nearest friendly distance.
+                let nearest_friendly_dist = self.drones.iter()
+                    .filter(|d| Self::drone_in_group(d.id, group, self.group_split_id) && d.id != drone.id)
+                    .map(|d| self.lib_bounds.distance(my_pos, d.agent.state().pos.as_vec2()))
+                    .fold(f32::INFINITY, f32::min);
+                obs[58] = if nearest_friendly_dist.is_finite() { nearest_friendly_dist / diag } else { 1.0 };
+
+                // Friendly density within detonation radius.
+                let friendlies_in_blast = self.drones.iter()
+                    .filter(|d| Self::drone_in_group(d.id, group, self.group_split_id) && d.id != drone.id)
+                    .filter(|d| self.lib_bounds.distance(my_pos, d.agent.state().pos.as_vec2()) <= DETONATION_RADIUS)
+                    .count() as f32;
+                obs[59] = (friendlies_in_blast / 8.0).clamp(0.0, 1.0);
+
+                // [60] Agent ID — unique per drone, breaks symmetry.
+                obs[60] = drone.id as f32 / agent.initial_own_drones;
+
+                // [61..64] Last actions of 3 nearest friendly drones (for coordination).
+                // Reuse the sorted friendlies list (sorted by distance) to get nearest IDs.
+                {
+                    let mut friendly_ids: Vec<(f32, u32)> = self.drones.iter()
+                        .filter(|d| Self::drone_in_group(d.id, group, self.group_split_id) && d.id != drone.id)
+                        .map(|d| (self.lib_bounds.distance(my_pos, d.agent.state().pos.as_vec2()), d.id))
+                        .collect();
+                    friendly_ids.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+                    for i in 0..3 {
+                        if i < friendly_ids.len() {
+                            let fid = friendly_ids[i].1;
+                            let act = self.rl_last_actions.get(&fid).copied().unwrap_or(13) as f32;
+                            obs[61 + i] = act / RL_ACT_DIM as f32;
+                        }
+                        // else: stays 0.0
+                    }
+                }
+
+                // Run policy.
+                let action = agent.model.act(&obs);
+                drone_actions.push((drone.id, action));
+            }
+        }
+
+        // Apply actions.
+        for (drone_id, action) in drone_actions {
+            self.apply_multi_rl_action(drone_id, action);
+        }
+    }
+
+    /// Apply a per-drone RL action (0-13) to a specific drone.
+    ///
+    /// Action space matches sim_runner:
+    ///   0-2  = Attack nth enemy target (direct)
+    ///   3-5  = Attack nth enemy target (evasive)
+    ///   6-7  = Intercept nth enemy drone
+    ///   8    = Intercept enemy cluster
+    ///   9    = Defend nearest friendly target (tight: 100m orbit, 300m engage)
+    ///   10   = Defend nearest friendly target (wide: 250m orbit, 600m engage)
+    ///   11   = Patrol perimeter
+    ///   12   = Evade nearest threat
+    ///   13   = Hold
+    fn apply_multi_rl_action(&mut self, drone_id: u32, action: u32) {
+        // Record action for observation encoding.
+        self.rl_last_actions.insert(drone_id, action);
+
+        if action == 13 {
+            return; // Hold
+        }
+
+        let group = if drone_id < self.group_split_id { 0u32 } else { 1u32 };
+        let other_group = if group == 0 { 1 } else { 0 };
+
+        let drone_pos = match self.drones.iter().find(|d| d.id == drone_id) {
+            Some(d) => d.agent.state().pos.as_vec2(),
+            None => return,
+        };
+
+        match action {
+            // --- Attack (direct): nth nearest enemy target ---
+            0 | 1 | 2 => {
+                let nth = action as usize;
+                let target_pos = self.nth_nearest_enemy_target(drone_pos, other_group, nth);
+                if let Some(target) = target_pos {
+                    self.clear_drone_tasks_wasm(drone_id);
+                    if let Some(drone) = self.drones.iter_mut().find(|d| d.id == drone_id) {
+                        drone.agent.set_task(Box::new(AttackTask::new(target, DETONATION_RADIUS)));
+                    }
+                    self.attack_targets.insert(drone_id, target);
+                }
+            }
+
+            // --- Attack (evasive): nth nearest enemy target ---
+            3 | 4 | 5 => {
+                let nth = (action - 3) as usize;
+                let target_pos = self.nth_nearest_enemy_target(drone_pos, other_group, nth);
+                if let Some(target) = target_pos {
+                    self.clear_drone_tasks_wasm(drone_id);
+                    if let Some(drone) = self.drones.iter_mut().find(|d| d.id == drone_id) {
+                        drone.agent.set_task(Box::new(AttackTask::new_evasive(target, DETONATION_RADIUS)));
+                    }
+                    self.attack_targets.insert(drone_id, target);
+                }
+            }
+
+            // --- Intercept nearest / 2nd nearest enemy drone ---
+            6 | 7 => {
+                let nth = (action - 6) as usize;
+                let enemy_id = self.nth_nearest_enemy_drone_wasm(drone_pos, other_group, nth);
+                if let Some(eid) = enemy_id {
+                    self.clear_drone_tasks_wasm(drone_id);
+                    if let Some(drone) = self.drones.iter_mut().find(|d| d.id == drone_id) {
+                        let task = InterceptTask::new(drone_id as usize, eid as usize, group, DETONATION_RADIUS);
+                        drone.agent.set_task(Box::new(task));
+                    }
+                    self.intercept_targets.insert(drone_id, eid);
+                }
+            }
+
+            // --- Intercept enemy cluster ---
+            8 => {
+                self.clear_drone_tasks_wasm(drone_id);
+                if let Some(drone) = self.drones.iter_mut().find(|d| d.id == drone_id) {
+                    drone.agent.set_task(Box::new(InterceptGroupTask::new(group, DETONATION_RADIUS)));
+                }
+            }
+
+            // --- Defend nearest friendly target (tight) ---
+            9 => {
+                let target_pos = self.nth_nearest_friendly_target(drone_pos, group, 0);
+                if let Some(center) = target_pos {
+                    self.clear_drone_tasks_wasm(drone_id);
+                    if let Some(drone) = self.drones.iter_mut().find(|d| d.id == drone_id) {
+                        drone.agent.set_task(Box::new(DefendTask::new(
+                            drone_id as usize, group, center, 100.0, 300.0, DETONATION_RADIUS,
+                        )));
+                    }
+                }
+            }
+
+            // --- Defend nearest friendly target (wide) ---
+            10 => {
+                let target_pos = self.nth_nearest_friendly_target(drone_pos, group, 0);
+                if let Some(center) = target_pos {
+                    self.clear_drone_tasks_wasm(drone_id);
+                    if let Some(drone) = self.drones.iter_mut().find(|d| d.id == drone_id) {
+                        drone.agent.set_task(Box::new(DefendTask::new(
+                            drone_id as usize, group, center, 250.0, 600.0, DETONATION_RADIUS,
+                        )));
+                    }
+                }
+            }
+
+            // --- Patrol perimeter ---
+            11 => {
+                let friendly_positions: Vec<Position> = self.protected_zones
+                    .get(&group)
+                    .cloned()
+                    .unwrap_or_default();
+                if !friendly_positions.is_empty() {
+                    let waypoints = Self::build_patrol_route_static(&friendly_positions, RL_PATROL_STANDOFF);
+                    self.clear_drone_tasks_wasm(drone_id);
+                    if let Some(drone) = self.drones.iter_mut().find(|d| d.id == drone_id) {
+                        drone.agent.set_task(Box::new(PatrolTask::new(waypoints, 50.0, 2.0)));
+                    }
+                }
+            }
+
+            // --- Evade nearest threat ---
+            12 => {
+                self.clear_drone_tasks_wasm(drone_id);
+                if let Some(drone) = self.drones.iter_mut().find(|d| d.id == drone_id) {
+                    drone.agent.set_task(Box::new(EvadeTask::new(group)));
+                }
+            }
+
+            _ => {} // Unknown action — treat as hold
+        }
+    }
+
+    /// Clear attack/intercept tracking for a drone.
+    fn clear_drone_tasks_wasm(&mut self, drone_id: u32) {
+        self.attack_targets.remove(&drone_id);
+        self.intercept_targets.remove(&drone_id);
+    }
+
+    /// Get the Nth nearest enemy target position (from protected_zones).
+    fn nth_nearest_enemy_target(&self, drone_pos: Vec2, enemy_group: u32, nth: usize) -> Option<Position> {
+        let targets = self.protected_zones.get(&enemy_group)?;
+        let mut sorted: Vec<(f32, Position)> = targets.iter()
+            .map(|p| (self.lib_bounds.distance(drone_pos, p.as_vec2()), *p))
+            .collect();
+        sorted.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        sorted.get(nth).map(|(_, p)| *p)
+    }
+
+    /// Get the Nth nearest friendly target position (from protected_zones).
+    fn nth_nearest_friendly_target(&self, drone_pos: Vec2, own_group: u32, nth: usize) -> Option<Position> {
+        let targets = self.protected_zones.get(&own_group)?;
+        let mut sorted: Vec<(f32, Position)> = targets.iter()
+            .map(|p| (self.lib_bounds.distance(drone_pos, p.as_vec2()), *p))
+            .collect();
+        sorted.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        sorted.get(nth).map(|(_, p)| *p)
+    }
+
+    /// Get the ID of the Nth nearest enemy drone.
+    fn nth_nearest_enemy_drone_wasm(&self, drone_pos: Vec2, enemy_group: u32, nth: usize) -> Option<u32> {
+        let mut enemies: Vec<(f32, u32)> = self.drones.iter()
+            .filter(|d| Self::drone_in_group(d.id, enemy_group, self.group_split_id))
+            .map(|d| (self.lib_bounds.distance(drone_pos, d.agent.state().pos.as_vec2()), d.id))
+            .collect();
+        enemies.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        enemies.get(nth).map(|(_, id)| *id)
+    }
+
+    /// Check if a drone ID belongs to a given group.
+    fn drone_in_group(drone_id: u32, group: u32, split_id: u32) -> bool {
+        if group == 0 { drone_id < split_id } else { drone_id >= split_id }
+    }
+
+    /// Build patrol waypoints around target positions (static helper).
+    fn build_patrol_route_static(targets: &[Position], standoff: f32) -> Vec<Position> {
+        if targets.is_empty() {
+            return Vec::new();
+        }
+        let cx = targets.iter().map(|p| p.x()).sum::<f32>() / targets.len() as f32;
+        let cy = targets.iter().map(|p| p.y()).sum::<f32>() / targets.len() as f32;
+
+        if targets.len() <= 2 {
+            return (0..4)
+                .map(|i| {
+                    let angle = (i as f32 / 4.0) * std::f32::consts::TAU;
+                    Position::new(cx + standoff * angle.cos(), cy + standoff * angle.sin())
+                })
+                .collect();
+        }
+
+        // Push hull points outward from centroid.
+        targets.iter()
+            .map(|p| {
+                let dx = p.x() - cx;
+                let dy = p.y() - cy;
+                let dist = (dx * dx + dy * dy).sqrt().max(1.0);
+                Position::new(p.x() + (dx / dist) * standoff, p.y() + (dy / dist) * standoff)
+            })
+            .collect()
     }
 
     pub fn get_drone_at(&self, x: f32, y: f32, hit_radius: f32) -> Option<u32> {
@@ -1754,8 +2862,121 @@ pub fn intercept_drone(handle: &mut SwarmHandle, attacker_id: u32, target_drone_
 }
 
 #[wasm_bindgen]
+pub fn loiter_at(handle: &mut SwarmHandle, drone_id: u32, target_x: f32, target_y: f32) {
+    handle.swarm.loiter_at(drone_id, target_x, target_y);
+}
+
+#[wasm_bindgen]
+pub fn patrol_route(handle: &mut SwarmHandle, drone_id: u32, waypoints: JsValue, loiter_duration: f32) -> Result<(), JsValue> {
+    let points: Vec<Point> = serde_wasm_bindgen::from_value(waypoints)
+        .map_err(|e| JsValue::from_str(&format!("Invalid waypoints: {}", e)))?;
+    handle.swarm.patrol_route(drone_id, &points, loiter_duration);
+    Ok(())
+}
+
+#[wasm_bindgen]
+pub fn defend_position(
+    handle: &mut SwarmHandle,
+    drone_id: u32,
+    center_x: f32,
+    center_y: f32,
+    orbit_radius: f32,
+    engage_radius: f32,
+) {
+    handle.swarm.defend_position(drone_id, center_x, center_y, orbit_radius, engage_radius);
+}
+
+#[wasm_bindgen]
 pub fn return_to_formation(handle: &mut SwarmHandle, drone_id: u32, group_start: u32, group_end: u32) {
     handle.swarm.return_to_formation(drone_id, group_start, group_end);
+}
+
+#[wasm_bindgen]
+pub fn set_strategy_defend_area(
+    handle: &mut SwarmHandle,
+    drone_ids: JsValue,
+    center_x: f32,
+    center_y: f32,
+    radius: f32,
+) -> Result<(), JsValue> {
+    let ids: Vec<u32> = serde_wasm_bindgen::from_value(drone_ids)
+        .map_err(|e| JsValue::from_str(&format!("Invalid drone IDs: {}", e)))?;
+    handle.swarm.set_strategy_defend_area(&ids, center_x, center_y, radius);
+    Ok(())
+}
+
+#[wasm_bindgen]
+pub fn set_strategy_attack_zone(
+    handle: &mut SwarmHandle,
+    drone_ids: JsValue,
+    target_positions: JsValue,
+) -> Result<(), JsValue> {
+    let ids: Vec<u32> = serde_wasm_bindgen::from_value(drone_ids)
+        .map_err(|e| JsValue::from_str(&format!("Invalid drone IDs: {}", e)))?;
+    let positions: Vec<Point> = serde_wasm_bindgen::from_value(target_positions)
+        .map_err(|e| JsValue::from_str(&format!("Invalid target positions: {}", e)))?;
+    handle.swarm.set_strategy_attack_zone(&ids, &positions);
+    Ok(())
+}
+
+#[wasm_bindgen]
+pub fn set_strategy_patrol_perimeter(
+    handle: &mut SwarmHandle,
+    drone_ids: JsValue,
+    waypoints: JsValue,
+    loiter_duration: f32,
+) -> Result<(), JsValue> {
+    let ids: Vec<u32> = serde_wasm_bindgen::from_value(drone_ids)
+        .map_err(|e| JsValue::from_str(&format!("Invalid drone IDs: {}", e)))?;
+    let points: Vec<Point> = serde_wasm_bindgen::from_value(waypoints)
+        .map_err(|e| JsValue::from_str(&format!("Invalid waypoints: {}", e)))?;
+    handle.swarm.set_strategy_patrol_perimeter(&ids, &points, loiter_duration);
+    Ok(())
+}
+
+#[wasm_bindgen]
+pub fn clear_strategies(handle: &mut SwarmHandle) {
+    handle.swarm.clear_strategies();
+}
+
+#[wasm_bindgen]
+pub fn set_doctrine(
+    handle: &mut SwarmHandle,
+    drone_ids: JsValue,
+    friendly_targets: JsValue,
+    enemy_targets: JsValue,
+    patrol_waypoints: JsValue,
+    mode: &str,
+) -> Result<(), JsValue> {
+    let ids: Vec<u32> = serde_wasm_bindgen::from_value(drone_ids)
+        .map_err(|e| JsValue::from_str(&format!("Invalid drone IDs: {}", e)))?;
+    let friendly: Vec<Point> = serde_wasm_bindgen::from_value(friendly_targets)
+        .map_err(|e| JsValue::from_str(&format!("Invalid friendly targets: {}", e)))?;
+    let enemy: Vec<Point> = serde_wasm_bindgen::from_value(enemy_targets)
+        .map_err(|e| JsValue::from_str(&format!("Invalid enemy targets: {}", e)))?;
+    let waypoints: Vec<Point> = serde_wasm_bindgen::from_value(patrol_waypoints)
+        .map_err(|e| JsValue::from_str(&format!("Invalid patrol waypoints: {}", e)))?;
+    let doctrine_mode = match mode {
+        "defensive" => DoctrineMode::Defensive,
+        _ => DoctrineMode::Aggressive,
+    };
+    handle.swarm.set_doctrine(&ids, &friendly, &enemy, &waypoints, doctrine_mode);
+    Ok(())
+}
+
+#[wasm_bindgen]
+pub fn update_doctrine_targets(
+    handle: &mut SwarmHandle,
+    group: u32,
+    friendly_targets: JsValue,
+    enemy_targets: JsValue,
+) -> Result<(), JsValue> {
+    let friendly: Vec<Point> = serde_wasm_bindgen::from_value(friendly_targets)
+        .map_err(|e| JsValue::from_str(&format!("Invalid friendly targets: {}", e)))?;
+    let enemy: Vec<Point> = serde_wasm_bindgen::from_value(enemy_targets)
+        .map_err(|e| JsValue::from_str(&format!("Invalid enemy targets: {}", e)))?;
+    handle.swarm.update_doctrine_targets(group, &friendly, &enemy);
+    Ok(())
 }
 
 #[wasm_bindgen]
@@ -1769,6 +2990,65 @@ pub fn set_protected_zones(handle: &mut SwarmHandle, group: u32, positions: JsVa
         .map_err(|e| JsValue::from_str(&format!("Invalid positions: {}", e)))?;
     handle.swarm.set_protected_zones(group, positions);
     Ok(())
+}
+
+// ========================================================================
+// RL Agent WASM Bindings
+// ========================================================================
+
+#[wasm_bindgen]
+pub fn load_rl_model(
+    handle: &mut SwarmHandle,
+    group: u32,
+    model_json: &str,
+    initial_own_drones: f32,
+    initial_enemy_drones: f32,
+    initial_friendly_targets: f32,
+    initial_enemy_targets: f32,
+) -> Result<(), JsValue> {
+    handle.swarm.load_rl_model(
+        group,
+        model_json,
+        initial_own_drones,
+        initial_enemy_drones,
+        initial_friendly_targets,
+        initial_enemy_targets,
+    ).map_err(|e| JsValue::from_str(&e))
+}
+
+#[wasm_bindgen]
+pub fn load_rl_model_multi(
+    handle: &mut SwarmHandle,
+    group: u32,
+    model_json: &str,
+    initial_own_drones: f32,
+    initial_enemy_drones: f32,
+    initial_friendly_targets: f32,
+    initial_enemy_targets: f32,
+) -> Result<(), JsValue> {
+    handle.swarm.load_rl_model_multi(
+        group,
+        model_json,
+        initial_own_drones,
+        initial_enemy_drones,
+        initial_friendly_targets,
+        initial_enemy_targets,
+    ).map_err(|e| JsValue::from_str(&e))
+}
+
+#[wasm_bindgen]
+pub fn set_rl_agent_enabled(handle: &mut SwarmHandle, group: u32, enabled: bool) {
+    handle.swarm.set_rl_agent_enabled(group, enabled);
+}
+
+#[wasm_bindgen]
+pub fn update_rl_targets(handle: &mut SwarmHandle, group: u32, friendly_count: f32, enemy_count: f32) {
+    handle.swarm.update_rl_targets(group, friendly_count, enemy_count);
+}
+
+#[wasm_bindgen]
+pub fn remove_rl_agent(handle: &mut SwarmHandle, group: u32) {
+    handle.swarm.remove_rl_agent(group);
 }
 
 #[wasm_bindgen]

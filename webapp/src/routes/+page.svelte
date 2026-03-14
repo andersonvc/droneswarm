@@ -13,8 +13,10 @@
         clearSelection,
         detonateRandomDrone,
         launchAttack,
-        toggleCAP,
-        capActive,
+        gameResult,
+        groupAStrategy,
+        groupBStrategy,
+        setGroupStrategy,
     } from '$lib/stores/simulation';
     import SimulationCanvas from '$lib/components/SimulationCanvas.svelte';
     import ControlPanel from '$lib/components/ControlPanel.svelte';
@@ -23,6 +25,7 @@
     import PathModeIndicator from '$lib/components/PathModeIndicator.svelte';
     import ConfigModal from '$lib/components/ConfigModal.svelte';
     import ConfigSidePanel from '$lib/components/ConfigSidePanel.svelte';
+    import StrategySelector from '$lib/components/StrategySelector.svelte';
 
     let animationFrame: number;
     let lastTime = 0;
@@ -31,6 +34,7 @@
     let configPanelOpen = $state(false);
     let canvasWidth = $state(1000);
     let canvasHeight = $state(1000);
+    let restartTimer: ReturnType<typeof setTimeout> | null = null;
 
     function updateCanvasSize() {
         if (typeof window === 'undefined') return;
@@ -41,19 +45,38 @@
         canvasHeight = window.innerHeight;
     }
 
+    let unsubGameResult: (() => void) | null = null;
+
     onMount(async () => {
         updateCanvasSize();
         window.addEventListener('resize', updateCanvasSize);
 
         await initSimulation();
-        // Auto-start the simulation
         handleStart();
+
+        // Auto-restart 3s after a win, preserving strategies
+        unsubGameResult = gameResult.subscribe((result) => {
+            if (result !== null && restartTimer === null) {
+                restartTimer = setTimeout(async () => {
+                    const savedA = $groupAStrategy;
+                    const savedB = $groupBStrategy;
+                    await handleReset();
+                    if (savedA !== 'none') setGroupStrategy(0, savedA);
+                    if (savedB !== 'none') setGroupStrategy(1, savedB);
+                    restartTimer = null;
+                }, 3000);
+            }
+        });
     });
 
     onDestroy(() => {
         if (animationFrame) {
             cancelAnimationFrame(animationFrame);
         }
+        if (restartTimer) {
+            clearTimeout(restartTimer);
+        }
+        unsubGameResult?.();
         if (typeof window !== 'undefined') {
             window.removeEventListener('resize', updateCanvasSize);
         }
@@ -112,8 +135,6 @@
             detonateRandomDrone();
         } else if (e.key === 'a' || e.key === 'A') {
             launchAttack();
-        } else if (e.key === 'c' || e.key === 'C') {
-            toggleCAP();
         } else if (e.key === ' ') {
             e.preventDefault();
             if ($isRunning) {
@@ -143,9 +164,9 @@
             <button class="config-btn" onclick={() => configPanelOpen = true}>
                 Edit Configs
             </button>
-            <button class="cap-btn" class:cap-active={$capActive} onclick={toggleCAP}>
-                {$capActive ? 'CAP Active' : 'Start CAP'}
-            </button>
+            <div class="strategy-section">
+                <StrategySelector />
+            </div>
             <ConfigModal />
             <div class="sidebar-spacer"></div>
             <StatusBar />
@@ -275,29 +296,9 @@
         border-color: #9DFF20;
     }
 
-    .cap-btn {
-        background: #1a1a1f;
-        border: 1px solid #2a2a30;
-        color: #9ca3af;
-        padding: 10px 16px;
-        border-radius: 6px;
-        font-size: 13px;
-        font-family: 'DM Sans', system-ui, sans-serif;
-        cursor: pointer;
-        transition: all 0.15s ease;
-        margin-top: 8px;
-        width: 100%;
-    }
-
-    .cap-btn:hover {
-        background: #252530;
-        color: #fff;
-        border-color: #ff6b35;
-    }
-
-    .cap-btn.cap-active {
-        background: #2a1a10;
-        border-color: #ff6b35;
-        color: #ff6b35;
+    .strategy-section {
+        margin-top: 12px;
+        padding-top: 12px;
+        border-top: 1px solid #1f1f25;
     }
 </style>

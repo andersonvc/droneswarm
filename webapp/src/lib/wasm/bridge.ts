@@ -29,6 +29,17 @@ import init, {
     clear_formation,
     formation_command,
     update_formation,
+    set_strategy_defend_area,
+    set_strategy_attack_zone,
+    set_strategy_patrol_perimeter,
+    clear_strategies,
+    set_doctrine,
+    update_doctrine_targets,
+    load_rl_model,
+    load_rl_model_multi,
+    set_rl_agent_enabled,
+    update_rl_targets,
+    remove_rl_agent,
     type SwarmHandle,
 } from 'wasm-lib';
 
@@ -252,6 +263,91 @@ export class SwarmManager {
     updateFormation(): void {
         if (!this.handle) return;
         update_formation(this.handle);
+    }
+
+    setStrategyDefendArea(droneIds: number[], centerX: number, centerY: number, radius: number): void {
+        if (!this.handle) return;
+        set_strategy_defend_area(this.handle, droneIds, centerX, centerY, radius);
+    }
+
+    setStrategyAttackZone(droneIds: number[], targetPositions: Point[]): void {
+        if (!this.handle) return;
+        set_strategy_attack_zone(this.handle, droneIds, targetPositions);
+    }
+
+    setStrategyPatrolPerimeter(droneIds: number[], waypoints: Point[], loiterDuration: number): void {
+        if (!this.handle) return;
+        set_strategy_patrol_perimeter(this.handle, droneIds, waypoints, loiterDuration);
+    }
+
+    clearStrategies(): void {
+        if (!this.handle) return;
+        clear_strategies(this.handle);
+    }
+
+    setDoctrine(droneIds: number[], friendlyTargets: Point[], enemyTargets: Point[], patrolWaypoints: Point[], mode: string): void {
+        if (!this.handle) return;
+        set_doctrine(this.handle, droneIds, friendlyTargets, enemyTargets, patrolWaypoints, mode);
+    }
+
+    updateDoctrineTargets(group: number, friendlyTargets: Point[], enemyTargets: Point[]): void {
+        if (!this.handle) return;
+        update_doctrine_targets(this.handle, group, friendlyTargets, enemyTargets);
+    }
+
+    loadRlModel(
+        group: number,
+        modelJson: string,
+        initialOwnDrones: number,
+        initialEnemyDrones: number,
+        initialFriendlyTargets: number,
+        initialEnemyTargets: number,
+    ): void {
+        if (!this.handle) return;
+        load_rl_model(
+            this.handle,
+            group,
+            modelJson,
+            initialOwnDrones,
+            initialEnemyDrones,
+            initialFriendlyTargets,
+            initialEnemyTargets,
+        );
+    }
+
+    loadRlModelMulti(
+        group: number,
+        modelJson: string,
+        initialOwnDrones: number,
+        initialEnemyDrones: number,
+        initialFriendlyTargets: number,
+        initialEnemyTargets: number,
+    ): void {
+        if (!this.handle) return;
+        load_rl_model_multi(
+            this.handle,
+            group,
+            modelJson,
+            initialOwnDrones,
+            initialEnemyDrones,
+            initialFriendlyTargets,
+            initialEnemyTargets,
+        );
+    }
+
+    setRlAgentEnabled(group: number, enabled: boolean): void {
+        if (!this.handle) return;
+        set_rl_agent_enabled(this.handle, group, enabled);
+    }
+
+    updateRlTargets(group: number, friendlyCount: number, enemyCount: number): void {
+        if (!this.handle) return;
+        update_rl_targets(this.handle, group, friendlyCount, enemyCount);
+    }
+
+    removeRlAgent(group: number): void {
+        if (!this.handle) return;
+        remove_rl_agent(this.handle, group);
     }
 
     destroy(): void {
