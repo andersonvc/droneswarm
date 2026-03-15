@@ -1,14 +1,15 @@
-//! Shared observation encoding for per-drone RL observations.
+//! Entity-based observation encoding for per-drone RL (V2).
 //!
-//! Used by both `sim_runner` and `wasm-lib` to produce identical 64-dim
-//! observation vectors from game state.
+//! Produces structured observations: ego features (fixed 25-dim) + entity tokens
+//! (variable-length 8-dim each). Used by sim_runner for training and wasm-lib for inference.
 
 use std::collections::HashMap;
 
 use crate::types::{Bounds, Position, Vec2};
 
-use super::obs_layout::obs_idx;
-use super::obs_layout::{ACT_DIM, MAX_VELOCITY, OBS_DIM};
+use super::obs_layout::{
+    ego_idx, entity_idx, entity_type, ACT_DIM, EGO_DIM, ENTITY_DIM, MAX_VELOCITY,
+};
 use super::state::{GameDrone, TargetState};
 
 /// Configuration for observation encoding.
@@ -22,10 +23,12 @@ pub struct ObservationEncoderConfig {
     pub max_nearby_threats: f32,
 }
 
-/// Encode a 64-dim observation vector for a single drone.
+/// Encode a V2 observation for a single drone.
 ///
-/// All distances are normalized by world size or diagonal; all counts by initial counts.
-/// The observation is group-symmetric: "friendly" and "enemy" are relative to the drone's group.
+/// Returns (ego, entities_flat, n_entities):
+/// - ego: EGO_DIM floats
+/// - entities_flat: n_entities * ENTITY_DIM floats (all entities concatenated)
+/// - n_entities: number of real entities
 pub fn encode_drone_observation(
     drone: &GameDrone,
     all_drones: &[GameDrone],
@@ -35,141 +38,51 @@ pub fn encode_drone_observation(
     tick_count: u32,
     bounds: &Bounds,
     config: &ObservationEncoderConfig,
-) -> [f32; OBS_DIM] {
+) -> (Vec<f32>, Vec<f32>, usize) {
     let w = config.world_size;
     let diag = (w * w + w * w).sqrt();
     let state = drone.agent.state();
     let my_pos = state.pos.as_vec2();
+    let my_heading = state.hdg.radians();
 
-    let mut obs = [0.0f32; OBS_DIM];
+    // ========================================================================
+    // Ego features [0..25]
+    // ========================================================================
+    let mut ego = vec![0.0f32; EGO_DIM];
 
-    // [0..5] Ego state
-    obs[obs_idx::EGO_X] = state.pos.x() / w;
-    obs[obs_idx::EGO_Y] = state.pos.y() / w;
-    obs[obs_idx::EGO_VX] = state.vel.as_vec2().x / MAX_VELOCITY;
-    obs[obs_idx::EGO_VY] = state.vel.as_vec2().y / MAX_VELOCITY;
-    let last_action = last_actions.get(&drone.id).copied().unwrap_or(13) as f32;
-    obs[obs_idx::EGO_LAST_ACTION] = last_action / ACT_DIM as f32;
+    ego[ego_idx::X] = state.pos.x() / w;
+    ego[ego_idx::Y] = state.pos.y() / w;
+    ego[ego_idx::VX] = state.vel.as_vec2().x / MAX_VELOCITY;
+    ego[ego_idx::VY] = state.vel.as_vec2().y / MAX_VELOCITY;
+    ego[ego_idx::HEADING] = my_heading / (2.0 * std::f32::consts::PI);
+    let last_action = last_actions.get(&drone.id).copied().unwrap_or(0) as f32;
+    ego[ego_idx::LAST_ACTION] = last_action / ACT_DIM as f32;
 
-    // [5..25] 4 nearest enemy drones
-    let mut enemy_drones: Vec<(f32, f32, f32, f32, f32)> = all_drones
-        .iter()
-        .filter(|d| d.group != drone.group)
-        .map(|d| {
-            let es = d.agent.state();
-            let epos = es.pos.as_vec2();
-            let dist = bounds.distance(my_pos, epos);
-            (
-                (epos.x - my_pos.x) / w,
-                (epos.y - my_pos.y) / w,
-                dist / diag,
-                es.vel.as_vec2().x / MAX_VELOCITY,
-                es.vel.as_vec2().y / MAX_VELOCITY,
-            )
-        })
-        .collect();
-    enemy_drones.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap());
-
-    for i in 0..obs_idx::ENEMY_DRONES_COUNT {
-        let base = obs_idx::ENEMY_DRONES_START + i * obs_idx::ENEMY_DRONE_STRIDE;
-        if i < enemy_drones.len() {
-            let e = &enemy_drones[i];
-            obs[base + obs_idx::REL_DX] = e.0;
-            obs[base + obs_idx::REL_DY] = e.1;
-            obs[base + obs_idx::REL_DIST] = e.2;
-            obs[base + obs_idx::REL_VX] = e.3;
-            obs[base + obs_idx::REL_VY] = e.4;
-        } else {
-            obs[base + obs_idx::REL_DX] = 1.0;
-            obs[base + obs_idx::REL_DY] = 1.0;
-            obs[base + obs_idx::REL_DIST] = 1.0;
+    // Task type one-hot [6..15]
+    if let Some((task_name, phase_name)) = drone.agent.task_info() {
+        let task_idx = task_name_to_index(task_name);
+        if task_idx > 0 && task_idx < ego_idx::TASK_TYPE_COUNT {
+            ego[ego_idx::TASK_TYPE_START + task_idx] = 1.0;
         }
+        ego[ego_idx::TASK_PHASE] = phase_to_ordinal(phase_name);
     }
+    // If no task, all task one-hot bits remain 0 (index 0 = None is implicit)
 
-    // [25..40] 3 nearest friendly drones
-    let mut friendly_drones: Vec<(f32, f32, f32, f32, f32)> = all_drones
+    // Relative alive index: position of this drone in sorted alive same-group IDs
+    let mut alive_same_group: Vec<usize> = all_drones
         .iter()
-        .filter(|d| d.group == drone.group && d.id != drone.id)
-        .map(|d| {
-            let fs = d.agent.state();
-            let fpos = fs.pos.as_vec2();
-            let dist = bounds.distance(my_pos, fpos);
-            (
-                (fpos.x - my_pos.x) / w,
-                (fpos.y - my_pos.y) / w,
-                dist / diag,
-                fs.vel.as_vec2().x / MAX_VELOCITY,
-                fs.vel.as_vec2().y / MAX_VELOCITY,
-            )
-        })
+        .filter(|d| d.group == drone.group)
+        .map(|d| d.id)
         .collect();
-    friendly_drones.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap());
-
-    for i in 0..obs_idx::FRIENDLY_DRONES_COUNT {
-        let base = obs_idx::FRIENDLY_DRONES_START + i * obs_idx::FRIENDLY_DRONE_STRIDE;
-        if i < friendly_drones.len() {
-            let f = &friendly_drones[i];
-            obs[base + obs_idx::REL_DX] = f.0;
-            obs[base + obs_idx::REL_DY] = f.1;
-            obs[base + obs_idx::REL_DIST] = f.2;
-            obs[base + obs_idx::REL_VX] = f.3;
-            obs[base + obs_idx::REL_VY] = f.4;
-        } else {
-            obs[base + obs_idx::REL_DX] = 1.0;
-            obs[base + obs_idx::REL_DY] = 1.0;
-            obs[base + obs_idx::REL_DIST] = 1.0;
-        }
-    }
-
-    // [40..46] 3 nearest enemy targets
-    let enemy_target_list = if drone.group == 0 { targets_b } else { targets_a };
-    let mut enemy_targets: Vec<(f32, f32, f32)> = enemy_target_list
+    alive_same_group.sort_unstable();
+    let alive_count = alive_same_group.len().max(1) as f32;
+    let my_rank = alive_same_group
         .iter()
-        .filter(|t| !t.destroyed)
-        .map(|t| {
-            let dist = bounds.distance(my_pos, t.pos.as_vec2());
-            (
-                (t.pos.x() - state.pos.x()) / w,
-                (t.pos.y() - state.pos.y()) / w,
-                dist,
-            )
-        })
-        .collect();
-    enemy_targets.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap());
+        .position(|&id| id == drone.id)
+        .unwrap_or(0) as f32;
+    ego[ego_idx::RELATIVE_ALIVE_INDEX] = my_rank / alive_count;
 
-    for i in 0..obs_idx::ENEMY_TARGETS_COUNT {
-        let base = obs_idx::ENEMY_TARGETS_START + i * obs_idx::ENEMY_TARGET_STRIDE;
-        if i < enemy_targets.len() {
-            obs[base] = enemy_targets[i].0;
-            obs[base + 1] = enemy_targets[i].1;
-        }
-    }
-
-    // [46..52] 3 nearest friendly targets
-    let friendly_target_list = if drone.group == 0 { targets_a } else { targets_b };
-    let mut friendly_targets: Vec<(f32, f32, f32)> = friendly_target_list
-        .iter()
-        .filter(|t| !t.destroyed)
-        .map(|t| {
-            let dist = bounds.distance(my_pos, t.pos.as_vec2());
-            (
-                (t.pos.x() - state.pos.x()) / w,
-                (t.pos.y() - state.pos.y()) / w,
-                dist,
-            )
-        })
-        .collect();
-    friendly_targets.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap());
-
-    for i in 0..obs_idx::FRIENDLY_TARGETS_COUNT {
-        let base = obs_idx::FRIENDLY_TARGETS_START + i * obs_idx::FRIENDLY_TARGET_STRIDE;
-        if i < friendly_targets.len() {
-            obs[base] = friendly_targets[i].0;
-            obs[base + 1] = friendly_targets[i].1;
-        }
-    }
-
-    // [52..60] Global features
+    // Global features [17..25]
     let initial_d = config.initial_drones_per_side as f32;
     let initial_t = config.initial_targets_per_side as f32;
     let own_group = drone.group;
@@ -178,57 +91,260 @@ pub fn encode_drone_observation(
     let alive_a = targets_a.iter().filter(|t| !t.destroyed).count();
     let alive_b = targets_b.iter().filter(|t| !t.destroyed).count();
 
-    obs[obs_idx::GLOBAL_OWN_DRONES] = count_group(own_group) as f32 / initial_d;
-    obs[obs_idx::GLOBAL_ENEMY_DRONES] = count_group(enemy_group) as f32 / initial_d;
+    ego[ego_idx::GLOBAL_OWN_DRONES] = count_group(own_group) as f32 / initial_d;
+    ego[ego_idx::GLOBAL_ENEMY_DRONES] = count_group(enemy_group) as f32 / initial_d;
     let (own_targets_alive, enemy_targets_alive) = if own_group == 0 {
         (alive_a, alive_b)
     } else {
         (alive_b, alive_a)
     };
-    obs[obs_idx::GLOBAL_OWN_TARGETS] = own_targets_alive as f32 / initial_t;
-    obs[obs_idx::GLOBAL_ENEMY_TARGETS] = enemy_targets_alive as f32 / initial_t;
-    obs[obs_idx::GLOBAL_TIME_FRAC] = tick_count as f32 / config.max_ticks as f32;
+    ego[ego_idx::GLOBAL_OWN_TARGETS] = own_targets_alive as f32 / initial_t;
+    ego[ego_idx::GLOBAL_ENEMY_TARGETS] = enemy_targets_alive as f32 / initial_t;
+    ego[ego_idx::GLOBAL_TIME_FRAC] = tick_count as f32 / config.max_ticks as f32;
 
-    let threats = count_nearby_threats(all_drones, targets_a, targets_b, own_group, config.detonation_radius, config.threat_radius_multiplier, bounds);
-    obs[obs_idx::GLOBAL_THREATS] = (threats as f32 / config.max_nearby_threats).clamp(0.0, 1.0);
+    let threats = count_nearby_threats(
+        all_drones,
+        targets_a,
+        targets_b,
+        own_group,
+        config.detonation_radius,
+        config.threat_radius_multiplier,
+        bounds,
+    );
+    ego[ego_idx::GLOBAL_THREATS] = (threats as f32 / config.max_nearby_threats).clamp(0.0, 1.0);
 
-    // Nearest friendly distance
     let nearest_friendly_dist = all_drones
         .iter()
         .filter(|d| d.group == drone.group && d.id != drone.id)
         .map(|d| bounds.distance(my_pos, d.agent.state().pos.as_vec2()))
         .fold(f32::INFINITY, f32::min);
-    obs[obs_idx::GLOBAL_NEAREST_FRIENDLY_DIST] =
-        if nearest_friendly_dist.is_finite() { nearest_friendly_dist / diag } else { 1.0 };
+    ego[ego_idx::GLOBAL_NEAREST_FRIENDLY_DIST] = if nearest_friendly_dist.is_finite() {
+        nearest_friendly_dist / diag
+    } else {
+        1.0
+    };
 
-    // Friendly density within detonation radius
     let friendlies_in_blast = all_drones
         .iter()
         .filter(|d| d.group == drone.group && d.id != drone.id)
-        .filter(|d| bounds.distance(my_pos, d.agent.state().pos.as_vec2()) <= config.detonation_radius)
+        .filter(|d| {
+            bounds.distance(my_pos, d.agent.state().pos.as_vec2()) <= config.detonation_radius
+        })
         .count() as f32;
-    obs[obs_idx::GLOBAL_FRIENDLIES_IN_BLAST] = (friendlies_in_blast / 8.0).clamp(0.0, 1.0);
+    ego[ego_idx::GLOBAL_FRIENDLIES_IN_BLAST] = (friendlies_in_blast / 8.0).clamp(0.0, 1.0);
 
-    // [60] Agent ID
-    obs[obs_idx::AGENT_ID] = drone.id as f32 / config.initial_drones_per_side as f32;
+    // ========================================================================
+    // Entity tokens (variable length, sorted by distance within each type group)
+    // ========================================================================
+    let mut entities: Vec<[f32; ENTITY_DIM]> = Vec::new();
 
-    // [61..64] Last actions of 3 nearest friendly drones
-    let mut friendly_ids_sorted: Vec<(f32, usize)> = all_drones
+    // Enemy drones
+    let mut enemy_drones: Vec<(f32, &GameDrone)> = all_drones
         .iter()
-        .filter(|d| d.group == drone.group && d.id != drone.id)
-        .map(|d| (bounds.distance(my_pos, d.agent.state().pos.as_vec2()), d.id))
+        .filter(|d| d.group != drone.group)
+        .map(|d| {
+            let dist = bounds.distance(my_pos, d.agent.state().pos.as_vec2());
+            (dist, d)
+        })
         .collect();
-    friendly_ids_sorted.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-
-    for i in 0..obs_idx::FRIENDLY_ACTIONS_COUNT {
-        if i < friendly_ids_sorted.len() {
-            let fid = friendly_ids_sorted[i].1;
-            let action = last_actions.get(&fid).copied().unwrap_or(13) as f32;
-            obs[obs_idx::FRIENDLY_ACTIONS_START + i] = action / ACT_DIM as f32;
-        }
+    enemy_drones.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    for (_, d) in &enemy_drones {
+        entities.push(make_drone_entity(
+            d,
+            my_pos,
+            my_heading,
+            w,
+            diag,
+            bounds,
+            entity_type::ENEMY_DRONE,
+        ));
     }
 
-    obs
+    // Friendly drones (excluding self)
+    let mut friendly_drones: Vec<(f32, &GameDrone)> = all_drones
+        .iter()
+        .filter(|d| d.group == drone.group && d.id != drone.id)
+        .map(|d| {
+            let dist = bounds.distance(my_pos, d.agent.state().pos.as_vec2());
+            (dist, d)
+        })
+        .collect();
+    friendly_drones.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    for (_, d) in &friendly_drones {
+        entities.push(make_drone_entity(
+            d,
+            my_pos,
+            my_heading,
+            w,
+            diag,
+            bounds,
+            entity_type::FRIENDLY_DRONE,
+        ));
+    }
+
+    // Enemy targets
+    let enemy_target_list = if drone.group == 0 {
+        targets_b
+    } else {
+        targets_a
+    };
+    let mut enemy_targets: Vec<(f32, &TargetState)> = enemy_target_list
+        .iter()
+        .filter(|t| !t.destroyed)
+        .map(|t| {
+            let dist = bounds.distance(my_pos, t.pos.as_vec2());
+            (dist, t)
+        })
+        .collect();
+    enemy_targets.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    for (_, t) in &enemy_targets {
+        entities.push(make_target_entity(
+            t,
+            my_pos,
+            my_heading,
+            w,
+            diag,
+            bounds,
+            entity_type::ENEMY_TARGET,
+        ));
+    }
+
+    // Friendly targets
+    let friendly_target_list = if drone.group == 0 {
+        targets_a
+    } else {
+        targets_b
+    };
+    let mut friendly_targets: Vec<(f32, &TargetState)> = friendly_target_list
+        .iter()
+        .filter(|t| !t.destroyed)
+        .map(|t| {
+            let dist = bounds.distance(my_pos, t.pos.as_vec2());
+            (dist, t)
+        })
+        .collect();
+    friendly_targets.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    for (_, t) in &friendly_targets {
+        entities.push(make_target_entity(
+            t,
+            my_pos,
+            my_heading,
+            w,
+            diag,
+            bounds,
+            entity_type::FRIENDLY_TARGET,
+        ));
+    }
+
+    // Flatten entity tokens
+    let n_entities = entities.len();
+    let mut entities_flat = Vec::with_capacity(n_entities * ENTITY_DIM);
+    for token in &entities {
+        entities_flat.extend_from_slice(token);
+    }
+
+    (ego, entities_flat, n_entities)
+}
+
+/// Create an 8-dim entity token for a drone.
+fn make_drone_entity(
+    d: &GameDrone,
+    my_pos: Vec2,
+    my_heading: f32,
+    w: f32,
+    diag: f32,
+    bounds: &Bounds,
+    type_flag: f32,
+) -> [f32; ENTITY_DIM] {
+    let es = d.agent.state();
+    let epos = es.pos.as_vec2();
+    let dx = epos.x - my_pos.x;
+    let dy = epos.y - my_pos.y;
+    let dist = bounds.distance(my_pos, epos);
+    let heading_to = dy.atan2(dx);
+    let heading_rel = normalize_angle(heading_to - my_heading) / std::f32::consts::PI;
+
+    let mut token = [0.0f32; ENTITY_DIM];
+    token[entity_idx::DX] = dx / w;
+    token[entity_idx::DY] = dy / w;
+    token[entity_idx::DIST] = dist / diag;
+    token[entity_idx::VX] = es.vel.as_vec2().x / MAX_VELOCITY;
+    token[entity_idx::VY] = es.vel.as_vec2().y / MAX_VELOCITY;
+    token[entity_idx::HEADING_REL] = heading_rel;
+    token[entity_idx::TYPE_FLAG] = type_flag;
+    token[entity_idx::ALIVE_FLAG] = 1.0;
+    token
+}
+
+/// Create an 8-dim entity token for a target (no velocity/heading).
+fn make_target_entity(
+    t: &TargetState,
+    my_pos: Vec2,
+    my_heading: f32,
+    w: f32,
+    diag: f32,
+    bounds: &Bounds,
+    type_flag: f32,
+) -> [f32; ENTITY_DIM] {
+    let tpos = t.pos.as_vec2();
+    let dx = tpos.x - my_pos.x;
+    let dy = tpos.y - my_pos.y;
+    let dist = bounds.distance(my_pos, tpos);
+    let heading_to = dy.atan2(dx);
+    let heading_rel = normalize_angle(heading_to - my_heading) / std::f32::consts::PI;
+
+    let mut token = [0.0f32; ENTITY_DIM];
+    token[entity_idx::DX] = dx / w;
+    token[entity_idx::DY] = dy / w;
+    token[entity_idx::DIST] = dist / diag;
+    // vx, vy = 0 for targets
+    token[entity_idx::HEADING_REL] = heading_rel;
+    token[entity_idx::TYPE_FLAG] = type_flag;
+    token[entity_idx::ALIVE_FLAG] = 1.0;
+    token
+}
+
+/// Map task name string to one-hot index (0-8).
+/// Index 0 = None (no task), represented by all-zeros in the one-hot.
+fn task_name_to_index(name: &str) -> usize {
+    match name {
+        "Attack" => 1,
+        "AttackEvasive" => 2,
+        "Defend" => 3,
+        "Intercept" => 4,
+        "InterceptGroup" => 5,
+        "Evade" => 6,
+        "Loiter" => 7,
+        "Patrol" => 8,
+        _ => 0,
+    }
+}
+
+/// Map task phase string to ordinal in [0, 1].
+fn phase_to_ordinal(phase: &str) -> f32 {
+    match phase {
+        // Early/positioning phases
+        "navigate" | "approach" | "transit" | "orbit" => 0.0,
+        // Active engagement phases
+        "engage" | "pursue" | "pursue_cluster" | "flee" | "hold" | "loiter" => 0.33,
+        // Terminal phases
+        "terminal" => 0.67,
+        // Complete
+        "complete" | "done" => 1.0,
+        _ => 0.0,
+    }
+}
+
+/// Normalize angle to [-PI, PI].
+fn normalize_angle(angle: f32) -> f32 {
+    let mut a = angle;
+    while a > std::f32::consts::PI {
+        a -= 2.0 * std::f32::consts::PI;
+    }
+    while a < -std::f32::consts::PI {
+        a += 2.0 * std::f32::consts::PI;
+    }
+    a
 }
 
 /// Count enemy drones near friendly target centroid.
@@ -242,7 +358,11 @@ fn count_nearby_threats(
     bounds: &Bounds,
 ) -> usize {
     let targets = if group == 0 { targets_a } else { targets_b };
-    let alive: Vec<Position> = targets.iter().filter(|t| !t.destroyed).map(|t| t.pos).collect();
+    let alive: Vec<Position> = targets
+        .iter()
+        .filter(|t| !t.destroyed)
+        .map(|t| t.pos)
+        .collect();
     if alive.is_empty() {
         return 0;
     }
@@ -254,6 +374,9 @@ fn count_nearby_threats(
 
     drones
         .iter()
-        .filter(|d| d.group != group && bounds.distance(centroid, d.agent.state().pos.as_vec2()) <= threat_radius)
+        .filter(|d| {
+            d.group != group
+                && bounds.distance(centroid, d.agent.state().pos.as_vec2()) <= threat_radius
+        })
         .count()
 }

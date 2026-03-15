@@ -1,6 +1,7 @@
 //! PPO backward pass implementation.
 
 use crate::network::policy::PolicyNet;
+use crate::network::policy_v2::PolicyNetV2;
 
 /// Softmax over a slice.
 fn softmax(logits: &[f32]) -> Vec<f32> {
@@ -117,5 +118,82 @@ impl PolicyNetPPOExt for PolicyNet {
 
         // fc1 backward.
         let _grad_input = self.fc1.backward(&grad_h1);
+    }
+}
+
+/// Extension trait to add PPO-specific backward pass to PolicyNetV2.
+pub trait PolicyNetV2PPOExt {
+    /// Backward pass for PPO loss on a single sample with entity-attention.
+    /// Accumulates gradients (caller should call adam_step after full batch).
+    fn backward_ppo_v2(
+        &mut self,
+        ego: &[f32],
+        entities: &[f32],
+        n_entities: usize,
+        action: u32,
+        advantage: f32,
+        ret: f32,
+        old_log_prob: f32,
+        clip_range: f32,
+        vf_coef: f32,
+        ent_coef: f32,
+    );
+}
+
+impl PolicyNetV2PPOExt for PolicyNetV2 {
+    fn backward_ppo_v2(
+        &mut self,
+        ego: &[f32],
+        entities: &[f32],
+        n_entities: usize,
+        action: u32,
+        advantage: f32,
+        ret: f32,
+        old_log_prob: f32,
+        clip_range: f32,
+        vf_coef: f32,
+        ent_coef: f32,
+    ) {
+        // Forward pass (caches activations in each layer).
+        let (logits, value, _h2) = self.forward(ego, entities, n_entities);
+        let probs = softmax(&logits);
+        let new_log_prob = (probs[action as usize] + 1e-8).ln();
+
+        // Policy gradient.
+        let ratio = (new_log_prob - old_log_prob).exp();
+        let surr1 = ratio * advantage;
+        let surr2 = ratio.clamp(1.0 - clip_range, 1.0 + clip_range) * advantage;
+
+        // Clipping logic.
+        let clipped = ratio > 1.0 - clip_range && ratio < 1.0 + clip_range;
+        let use_surr1 = surr1 <= surr2;
+        let d_policy_d_logprob = if use_surr1 || clipped {
+            -advantage * ratio
+        } else {
+            0.0
+        };
+
+        // Gradient of PPO loss w.r.t. logits (policy + entropy).
+        let act_dim = logits.len();
+        let mut d_logits = vec![0.0f32; act_dim];
+        for j in 0..act_dim {
+            let indicator = if j == action as usize { 1.0 } else { 0.0 };
+            d_logits[j] += d_policy_d_logprob * (indicator - probs[j]);
+
+            let mut d_ent = 0.0;
+            for k in 0..act_dim {
+                let indicator_k = if k == j { 1.0 } else { 0.0 };
+                if probs[k] > 1e-8 {
+                    d_ent += -(probs[k].ln() + 1.0) * probs[k] * (indicator_k - probs[j]);
+                }
+            }
+            d_logits[j] -= ent_coef * d_ent;
+        }
+
+        // Gradient of value loss w.r.t. value output.
+        let d_value = vf_coef * 2.0 * (value - ret);
+
+        // Backward through the full network via backward_input.
+        let (_grad_ego, _grad_entities) = self.backward_input(&d_logits, d_value, n_entities);
     }
 }

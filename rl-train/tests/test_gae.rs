@@ -4,12 +4,16 @@ use rl_train::mlp::{compute_gae, Transition};
 
 fn make_transition(reward: f32, value: f32, done: bool) -> Transition {
     Transition {
-        obs: [0.0; 64],
+        ego_obs: vec![0.0; 25],
+        entity_obs: vec![],
+        n_entities: 0,
         action: 0,
         reward,
         value,
         log_prob: 0.0,
         done,
+        drone_died: false,
+        team_value_at_death: 0.0,
     }
 }
 

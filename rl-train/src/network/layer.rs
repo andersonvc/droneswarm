@@ -75,6 +75,42 @@ pub fn matmul_bias_relu(a: &[f32], w: &[f32], bias: &[f32], m: usize, n: usize, 
     c
 }
 
+/// Matrix multiply without bias: C = A @ B^T
+/// A: (m x k) row-major, B: (n x k) row-major, returns C: (m x n) row-major
+pub fn matmul_no_bias(a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
+    let mut c = vec![0.0f32; m * n];
+
+    #[cfg(target_os = "macos")]
+    {
+        unsafe {
+            cblas_sgemm(
+                101, 111, 112,                    // RowMajor, NoTrans, Trans
+                m as i32, n as i32, k as i32,
+                1.0, a.as_ptr(), k as i32,        // A: (m x k)
+                b.as_ptr(), k as i32,             // B: (n x k), transposed -> (k x n)
+                0.0, c.as_mut_ptr(), n as i32,    // C: (m x n)
+            );
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        for i in 0..m {
+            let a_row = &a[i * k..(i + 1) * k];
+            for j in 0..n {
+                let b_row = &b[j * k..(j + 1) * k];
+                let mut sum = 0.0f32;
+                for kk in 0..k {
+                    sum += a_row[kk] * b_row[kk];
+                }
+                c[i * n + j] = sum;
+            }
+        }
+    }
+
+    c
+}
+
 /// A dense (fully connected) layer with optional ReLU activation.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct DenseLayer {

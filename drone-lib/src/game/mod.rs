@@ -15,9 +15,7 @@ pub mod task_processing;
 
 #[cfg(feature = "inference")]
 pub mod action_mapping;
-#[cfg(feature = "inference")]
 pub mod obs_encoding;
-#[cfg(feature = "inference")]
 pub mod reward;
 
 #[cfg(test)]
