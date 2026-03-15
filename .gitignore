@@ -1,4 +1,5 @@
-target/
+**/target/
+results/
 .vscode
 emsdk/
 node_modules/
