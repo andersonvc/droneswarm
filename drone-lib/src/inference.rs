@@ -38,12 +38,13 @@ impl DenseLayer {
 
 /// Inference-only actor-critic policy network.
 ///
-/// Architecture: fc1(relu) → fc2(relu) → actor_head(linear)
+/// Architecture: fc1(relu) → fc2(relu) → fc3(relu) → actor_head(linear)
 /// Only the actor head is used for action selection.
 #[derive(Clone, Deserialize)]
 pub struct InferenceNet {
     pub fc1: DenseLayer,
     pub fc2: DenseLayer,
+    pub fc3: DenseLayer,
     pub actor_head: DenseLayer,
     // critic_head is deserialized but unused for inference
     pub critic_head: DenseLayer,
@@ -59,7 +60,8 @@ impl InferenceNet {
     pub fn forward(&self, obs: &[f32]) -> Vec<f32> {
         let h1 = self.fc1.forward(obs);
         let h2 = self.fc2.forward(&h1);
-        self.actor_head.forward(&h2)
+        let h3 = self.fc3.forward(&h2);
+        self.actor_head.forward(&h3)
     }
 
     /// Select the best action (argmax of softmax probabilities).
@@ -110,7 +112,7 @@ mod tests {
 
     #[test]
     fn test_argmax_action() {
-        // Construct a trivial net where fc1 and fc2 are identity-like
+        // Construct a trivial net where fc1, fc2, and fc3 are identity-like
         // and actor_head maps directly
         let net = InferenceNet {
             fc1: DenseLayer {
@@ -121,6 +123,13 @@ mod tests {
                 relu: true,
             },
             fc2: DenseLayer {
+                weights: vec![1.0, 0.0, 0.0, 1.0],
+                biases: vec![0.0, 0.0],
+                in_dim: 2,
+                out_dim: 2,
+                relu: true,
+            },
+            fc3: DenseLayer {
                 weights: vec![1.0, 0.0, 0.0, 1.0],
                 biases: vec![0.0, 0.0],
                 in_dim: 2,
@@ -143,7 +152,7 @@ mod tests {
             },
         };
         // Input [3.0, 1.0]:
-        // fc1: [3.0, 1.0] → fc2: [3.0, 1.0]
+        // fc1: [3.0, 1.0] → fc2: [3.0, 1.0] → fc3: [3.0, 1.0]
         // actor: [3*1+1*0, 3*0+1*1, 3*-1+1*-1] = [3.0, 1.0, -4.0]
         // argmax = 0
         assert_eq!(net.act(&[3.0, 1.0]), 0);

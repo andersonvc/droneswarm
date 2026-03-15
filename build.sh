@@ -5,6 +5,11 @@ PROJECT_ROOT="$(cd "$(dirname "$0")" && pwd)"
 WASM_DIR="$PROJECT_ROOT/wasm-lib"
 WEBAPP_DIR="$PROJECT_ROOT/webapp"
 
+echo "🧪 Running workspace tests..."
+cd "$PROJECT_ROOT"
+cargo test --workspace --exclude wasm-lib
+
+echo ""
 echo "🦀 Building WASM (release mode)..."
 cd "$WASM_DIR"
 rm -rf pkg

@@ -45,6 +45,10 @@
 	}
 }
 
+canvas {
+	touch-action: none;
+}
+
 /* Custom scrollbar for dark theme */
 ::-webkit-scrollbar {
 	width: 8px;

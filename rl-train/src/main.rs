@@ -3,16 +3,21 @@
 //! Performance optimizations:
 //! - Batched inference: all drone observations flattened into a matrix,
 //!   single cblas_sgemm call per layer (Accelerate on Apple Silicon).
-//! - Rayon: environment stepping parallelized across cores.
+//! - Rayon: environment stepping + PPO backward parallelized across cores.
+//! - mimalloc: thread-local allocator eliminates malloc contention.
 //! - Self-play with lagged opponent policy.
 //! - Curriculum learning: 4v4 → 8v8 → 16v16 → 24v24.
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use drone_lib::sim_runner::{GameResult, SimConfig, SimRunner, SelfPlayStepResult, OBS_DIM, ACT_DIM};
-use rl_train::mlp::{compute_gae, PolicyNet, Transition};
+use rl_train::mlp::{compute_gae, PolicyNet, Transition, PolicyNetPPOExt};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use rayon::prelude::*;
 use std::time::Instant;
+
 
 /// PPO training config.
 struct TrainConfig {
@@ -43,25 +48,25 @@ impl Default for TrainConfig {
     fn default() -> Self {
         TrainConfig {
             total_timesteps: 50_000_000,
-            n_steps: 256,
-            n_epochs: 10,
-            batch_size: 256,
-            lr: 3e-4,
+            n_steps: 512,
+            n_epochs: 4,
+            batch_size: 4096,
+            lr: 1e-4,
             gamma: 0.99,
             lam: 0.95,
             clip_range: 0.2,
-            ent_coef_start: 0.05,
+            ent_coef_start: 0.02,
             ent_coef_end: 0.001,
             vf_coef: 0.5,
             max_grad_norm: 0.5,
-            n_envs: 128,
-            hidden_size: 128,
+            n_envs: 1024,
+            hidden_size: 256,
             drones_per_side: 24,
             targets_per_side: 6,
-            max_ticks: 10000,
+            max_ticks: 6000,
             eval_freq: 50,
-            eval_episodes: 20,
-            opponent_update_freq: 10,
+            eval_episodes: 50,
+            opponent_update_freq: 30,
             output_dir: "results".to_string(),
         }
     }
@@ -184,11 +189,10 @@ struct EnvActionSlice {
 fn main() {
     let config = parse_args();
 
-    // Configure rayon thread pool.
+    // Configure rayon thread pool to use all available cores.
     let num_cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
-    let target_threads = 10;
     rayon::ThreadPoolBuilder::new()
-        .num_threads(target_threads)
+        .num_threads(num_cpus)
         .build_global()
         .expect("Failed to configure rayon thread pool");
 
@@ -221,6 +225,7 @@ fn main() {
 
     let mut total_steps = 0u64;
     let mut update_count = 0u64;
+    let mut adam_step_count = 0usize;
     let mut best_win_rate = 0.0f32;
     let mut ep_rewards: Vec<f32> = Vec::new();
     let mut ep_reward_accum = vec![0.0f32; config.n_envs];
@@ -272,89 +277,87 @@ fn main() {
         // ================================================================
         // Collect rollout with batched inference + parallel env stepping
         // ================================================================
-        let mut rollout: Vec<Transition> = Vec::new();
-        let mut rollout_env_indices: Vec<usize> = Vec::new();
+        // Pre-allocate rollout capacity: n_steps * n_envs * ~drones_per_side.
+        let est_transitions = config.n_steps * config.n_envs * curr_drones as usize;
+        let mut rollout: Vec<Transition> = Vec::with_capacity(est_transitions);
+        let mut rollout_env_indices: Vec<usize> = Vec::with_capacity(est_transitions);
+
+        // Pre-allocate reusable buffers for the rollout loop.
+        let max_drones = curr_drones as usize * 2; // both groups
+        let mut flat_obs_a: Vec<f32> = Vec::with_capacity(config.n_envs * max_drones * OBS_DIM);
+        let mut flat_obs_b: Vec<f32> = Vec::with_capacity(config.n_envs * max_drones * OBS_DIM);
+        let mut env_slices: Vec<EnvActionSlice> = Vec::with_capacity(config.n_envs);
+        // Flat ID buffers: store all drone IDs contiguously, indexed by env_slices.
+        let mut flat_ids_a: Vec<usize> = Vec::with_capacity(config.n_envs * max_drones);
+        let mut flat_ids_b: Vec<usize> = Vec::with_capacity(config.n_envs * max_drones);
 
         for _step in 0..config.n_steps {
-            // --- 1. Gather all obs into flat batches (copy to break borrow) ---
-            let mut all_obs_a: Vec<Vec<f32>> = Vec::new();
-            let mut all_obs_b: Vec<Vec<f32>> = Vec::new();
-            let mut env_slices: Vec<EnvActionSlice> = Vec::with_capacity(config.n_envs);
-            // Snapshot drone IDs so we can build actions after batch forward.
-            let mut snapshot_ids_a: Vec<Vec<usize>> = Vec::with_capacity(config.n_envs);
-            let mut snapshot_ids_b: Vec<Vec<usize>> = Vec::with_capacity(config.n_envs);
+            // --- 1. Flatten obs + IDs into pre-allocated buffers (no heap alloc) ---
+            flat_obs_a.clear();
+            flat_obs_b.clear();
+            flat_ids_a.clear();
+            flat_ids_b.clear();
+            env_slices.clear();
 
             for env_st in &env_states {
-                let a_start = all_obs_a.len();
+                let a_start = flat_obs_a.len() / OBS_DIM;
                 for obs in &env_st.obs_a {
-                    all_obs_a.push(obs.to_vec());
+                    flat_obs_a.extend_from_slice(obs);
                 }
-                let b_start = all_obs_b.len();
+                flat_ids_a.extend_from_slice(&env_st.drone_ids_a);
+                let b_start = flat_obs_b.len() / OBS_DIM;
                 for obs in &env_st.obs_b {
-                    all_obs_b.push(obs.to_vec());
+                    flat_obs_b.extend_from_slice(obs);
                 }
+                flat_ids_b.extend_from_slice(&env_st.drone_ids_b);
                 env_slices.push(EnvActionSlice {
                     a_start,
                     a_count: env_st.obs_a.len(),
                     b_start,
                     b_count: env_st.obs_b.len(),
                 });
-                snapshot_ids_a.push(env_st.drone_ids_a.clone());
-                snapshot_ids_b.push(env_st.drone_ids_b.clone());
             }
 
             // --- 2. Batched forward pass (Accelerate-optimized on macOS) ---
-            let refs_a: Vec<&[f32]> = all_obs_a.iter().map(|v| v.as_slice()).collect();
-            let refs_b: Vec<&[f32]> = all_obs_b.iter().map(|v| v.as_slice()).collect();
+            let total_a = flat_obs_a.len() / OBS_DIM;
+            let total_b = flat_obs_b.len() / OBS_DIM;
+            let refs_a: Vec<&[f32]> = (0..total_a).map(|i| &flat_obs_a[i * OBS_DIM..(i + 1) * OBS_DIM]).collect();
+            let refs_b: Vec<&[f32]> = (0..total_b).map(|i| &flat_obs_b[i * OBS_DIM..(i + 1) * OBS_DIM]).collect();
             let batch_a = policy.act_batch(&refs_a, &mut rng);
             let batch_b = opponent.act_batch(&refs_b, &mut rng);
 
-            // --- 3. Build per-env action lists ---
-            let mut per_env_actions_a: Vec<Vec<(usize, u32)>> = Vec::with_capacity(config.n_envs);
-            let mut per_env_actions_b: Vec<Vec<(usize, u32)>> = Vec::with_capacity(config.n_envs);
+            // --- 3. Build per-env actions + step in parallel ---
+            let per_env_results: Vec<(Vec<(usize, u32)>, Vec<(usize, u32)>, SelfPlayStepResult)> =
+                envs.par_iter_mut()
+                    .zip(env_slices.par_iter())
+                    .map(|(env, slice)| {
+                        let actions_a: Vec<(usize, u32)> = (0..slice.a_count)
+                            .map(|i| (flat_ids_a[slice.a_start + i], batch_a[slice.a_start + i].0))
+                            .collect();
+                        let actions_b: Vec<(usize, u32)> = (0..slice.b_count)
+                            .map(|i| (flat_ids_b[slice.b_start + i], batch_b[slice.b_start + i].0))
+                            .collect();
+                        let result = env.step_multi_selfplay(&actions_a, &actions_b);
+                        (actions_a, actions_b, result)
+                    })
+                    .collect();
 
-            for (env_idx, slice) in env_slices.iter().enumerate() {
-                let mut actions_a = Vec::with_capacity(slice.a_count);
-                for i in 0..slice.a_count {
-                    let (action, _, _) = batch_a[slice.a_start + i];
-                    actions_a.push((snapshot_ids_a[env_idx][i], action));
-                }
-                per_env_actions_a.push(actions_a);
-
-                let mut actions_b = Vec::with_capacity(slice.b_count);
-                for i in 0..slice.b_count {
-                    let (action, _, _) = batch_b[slice.b_start + i];
-                    actions_b.push((snapshot_ids_b[env_idx][i], action));
-                }
-                per_env_actions_b.push(actions_b);
-            }
-
-            // --- 4. Step all envs in parallel (rayon) ---
-            let step_results: Vec<SelfPlayStepResult> = envs.par_iter_mut()
-                .zip(per_env_actions_a.par_iter())
-                .zip(per_env_actions_b.par_iter())
-                .map(|((env, acts_a), acts_b)| {
-                    env.step_multi_selfplay(acts_a, acts_b)
-                })
-                .collect();
-
-            // --- 5. Collect transitions + handle resets (sequential) ---
+            // --- 4. Collect transitions + handle resets ---
             for env_idx in 0..config.n_envs {
-                let result = &step_results[env_idx];
+                let (_, _, ref result) = per_env_results[env_idx];
                 let slice = &env_slices[env_idx];
 
                 ep_reward_accum[env_idx] += result.reward;
                 let done = result.terminated || result.truncated;
-
-                // One transition per Group A drone.
-                let n_drones = slice.a_count.max(1);
-                let per_drone_reward = result.reward / n_drones as f32;
+                let per_drone_reward = result.reward;
 
                 for i in 0..slice.a_count {
                     let batch_idx = slice.a_start + i;
                     let (action, log_prob, value) = batch_a[batch_idx];
+                    let mut obs = [0.0f32; OBS_DIM];
+                    obs.copy_from_slice(&flat_obs_a[batch_idx * OBS_DIM..(batch_idx + 1) * OBS_DIM]);
                     rollout.push(Transition {
-                        obs: all_obs_a[batch_idx].clone(),
+                        obs,
                         action,
                         reward: per_drone_reward,
                         value,
@@ -466,9 +469,13 @@ fn main() {
         let current_lr = config.lr * (1.0 - progress);
         let current_ent_coef = config.ent_coef_start + (config.ent_coef_end - config.ent_coef_start) * progress;
 
-        // PPO update (parallel backward across rayon threads).
+        // PPO update (parallel backward with pre-allocated thread-local policies).
         let n = rollout.len();
-        let chunk_size = (config.batch_size / n_threads).max(1);
+        let chunk_size = (config.batch_size + n_threads - 1) / n_threads;
+        let mut thread_policies: Vec<PolicyNet> = (0..n_threads)
+            .map(|_| policy.clone())
+            .collect();
+
         for _epoch in 0..config.n_epochs {
             let mut indices: Vec<usize> = (0..n).collect();
             for i in (1..n).rev() {
@@ -480,14 +487,20 @@ fn main() {
                 let batch_end = (batch_start + config.batch_size).min(n);
                 let batch_size = batch_end - batch_start;
                 let batch_indices = &indices[batch_start..batch_end];
+                let chunks: Vec<&[usize]> = batch_indices.chunks(chunk_size).collect();
+                let n_chunks = chunks.len();
 
-                // Each thread gets a policy clone, runs backward on its chunk,
-                // then we reduce (sum) gradients back to the main policy.
-                policy.zero_grad();
-                let thread_grads: Vec<PolicyNet> = batch_indices
-                    .par_chunks(chunk_size)
-                    .map(|chunk| {
-                        let mut local = policy.clone();
+                // Copy current weights to thread-local policies (no allocation).
+                for tp in &mut thread_policies[..n_chunks] {
+                    tp.copy_weights_from(&policy);
+                }
+
+                // Parallel backward: each thread uses its pre-allocated policy.
+                thread_policies[..n_chunks]
+                    .par_iter_mut()
+                    .zip(chunks.into_par_iter())
+                    .for_each(|(local, chunk)| {
+                        local.zero_grad();
                         for &idx in chunk {
                             let t = &rollout[idx];
                             local.backward_ppo(
@@ -501,16 +514,17 @@ fn main() {
                                 current_ent_coef,
                             );
                         }
-                        local
-                    })
-                    .collect();
+                    });
 
-                for tg in &thread_grads {
-                    policy.add_grads_from(tg);
+                // Reduce gradients to main policy.
+                policy.zero_grad();
+                for tp in &thread_policies[..n_chunks] {
+                    policy.add_grads_from(tp);
                 }
 
                 policy.clip_grad_norm(config.max_grad_norm);
-                policy.sgd_step(current_lr, batch_size);
+                adam_step_count += 1;
+                policy.adam_step(current_lr, batch_size, 0.9, 0.999, 1e-8, 5e-4, adam_step_count);
             }
         }
 
@@ -583,7 +597,7 @@ fn parse_args() -> TrainConfig {
             "--help" | "-h" => {
                 println!("Usage: train [OPTIONS]");
                 println!("  --timesteps N             Total training steps (default 50000000)");
-                println!("  --n-envs N                Parallel environments (default 128)");
+                println!("  --n-envs N                Parallel environments (default 256)");
                 println!("  --drones N                Drones per side (default 24)");
                 println!("  --targets N               Targets per side (default 6)");
                 println!("  --max-ticks N             Max ticks per episode (default 10000)");

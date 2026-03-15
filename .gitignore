@@ -1,4 +1,6 @@
+target/
 .vscode
-wasm-lib/target
-drone-lib/target
-emsdk
+emsdk/
+node_modules/
+wasm-lib/pkg/
+.venv/

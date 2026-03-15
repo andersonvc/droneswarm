@@ -34,15 +34,17 @@
     let configPanelOpen = $state(false);
     let canvasWidth = $state(1000);
     let canvasHeight = $state(1000);
+    let isMobile = $state(false);
+    let mobileMenuOpen = $state(false);
     let restartTimer: ReturnType<typeof setTimeout> | null = null;
 
     function updateCanvasSize() {
         if (typeof window === 'undefined') return;
 
-        // Sidebar width is 220px + padding/border
+        isMobile = window.innerWidth < 768;
         const sidebarWidth = 220;
-        canvasWidth = window.innerWidth - sidebarWidth;
-        canvasHeight = window.innerHeight;
+        canvasWidth = isMobile ? window.innerWidth : window.innerWidth - sidebarWidth;
+        canvasHeight = isMobile ? window.innerHeight : window.innerHeight;
     }
 
     let unsubGameResult: (() => void) | null = null;
@@ -155,28 +157,59 @@
 
 <main onmousemove={handleMouseMove}>
     {#if $isInitialized}
-        <aside class="controls-sidebar">
-            <ControlPanel
-                onStart={handleStart}
-                onPause={handlePause}
-                onReset={handleReset}
-            />
-            <button class="config-btn" onclick={() => configPanelOpen = true}>
-                Edit Configs
-            </button>
-            <div class="strategy-section">
-                <StrategySelector />
+        {#if isMobile}
+            <div class="simulation-container">
+                <SimulationCanvas width={canvasWidth} height={canvasHeight} worldWidth={4000} worldHeight={4000} />
             </div>
+            <button class="mobile-menu-btn" onclick={() => mobileMenuOpen = !mobileMenuOpen}>
+                &#9776;
+            </button>
+            {#if mobileMenuOpen}
+                <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
+                <div class="mobile-overlay" role="presentation" onclick={() => mobileMenuOpen = false}></div>
+                <aside class="mobile-sidebar">
+                    <ControlPanel
+                        onStart={handleStart}
+                        onPause={handlePause}
+                        onReset={handleReset}
+                    />
+                    <button class="config-btn" onclick={() => configPanelOpen = true}>
+                        Edit Configs
+                    </button>
+                    <div class="strategy-section">
+                        <StrategySelector />
+                    </div>
+                    <div class="sidebar-spacer"></div>
+                    <StatusBar />
+                </aside>
+            {/if}
+            <PathModeIndicator />
             <ConfigModal />
-            <div class="sidebar-spacer"></div>
-            <StatusBar />
-        </aside>
-        <div class="simulation-container">
-            <SimulationCanvas width={canvasWidth} height={canvasHeight} worldWidth={4000} worldHeight={4000} />
-        </div>
-        <DroneTooltip x={tooltipX} y={tooltipY} />
-        <PathModeIndicator />
-        <ConfigSidePanel isOpen={configPanelOpen} onClose={() => configPanelOpen = false} />
+            <ConfigSidePanel isOpen={configPanelOpen} onClose={() => configPanelOpen = false} />
+        {:else}
+            <aside class="controls-sidebar">
+                <ControlPanel
+                    onStart={handleStart}
+                    onPause={handlePause}
+                    onReset={handleReset}
+                />
+                <button class="config-btn" onclick={() => configPanelOpen = true}>
+                    Edit Configs
+                </button>
+                <div class="strategy-section">
+                    <StrategySelector />
+                </div>
+                <ConfigModal />
+                <div class="sidebar-spacer"></div>
+                <StatusBar />
+            </aside>
+            <div class="simulation-container">
+                <SimulationCanvas width={canvasWidth} height={canvasHeight} worldWidth={4000} worldHeight={4000} />
+            </div>
+            <DroneTooltip x={tooltipX} y={tooltipY} />
+            <PathModeIndicator />
+            <ConfigSidePanel isOpen={configPanelOpen} onClose={() => configPanelOpen = false} />
+        {/if}
     {:else}
         <div class="loading">
             <div class="loading-text">Initializing Swarm</div>
@@ -300,5 +333,46 @@
         margin-top: 12px;
         padding-top: 12px;
         border-top: 1px solid #1f1f25;
+    }
+
+    .mobile-menu-btn {
+        position: fixed;
+        top: 12px;
+        right: 12px;
+        z-index: 50;
+        width: 44px;
+        height: 44px;
+        background: rgba(10, 10, 15, 0.85);
+        border: 1px solid #2a2a30;
+        border-radius: 8px;
+        color: #9DFF20;
+        font-size: 22px;
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+    }
+
+    .mobile-overlay {
+        position: fixed;
+        inset: 0;
+        background: rgba(0,0,0,0.5);
+        z-index: 90;
+    }
+
+    .mobile-sidebar {
+        position: fixed;
+        top: 0;
+        right: 0;
+        width: 260px;
+        height: 100%;
+        background: #101014;
+        border-left: 1px solid #1f1f25;
+        padding: 16px;
+        box-sizing: border-box;
+        z-index: 100;
+        display: flex;
+        flex-direction: column;
+        overflow-y: auto;
     }
 </style>

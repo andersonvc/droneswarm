@@ -8,8 +8,63 @@ import {
 } from '$lib/wasm/bridge';
 import { loadConfig, generateTwoClusterPositions, CLUSTER_A, CLUSTER_B } from '$lib/wasm/config';
 
+// Re-export from selection.ts
+export { hoveredDroneId, selectDrone, selectDronesInRect, clearSelection, getDroneAt } from './selection';
+// Re-export from game-state.ts
+export {
+    type Explosion,
+    explosions,
+    addExplosion,
+    type Target,
+    targets,
+    targetCounts,
+    checkTargetDestruction,
+    type GameResult,
+    gameResult,
+    generateTargets,
+    checkWinCondition,
+    buildPatrolRoute,
+    updateProtectedZones,
+} from './game-state';
+
+// Import from game-state for internal use
+import {
+    addExplosion,
+    targets,
+    gameResult,
+    generateTargets,
+    checkWinCondition,
+    buildPatrolRoute,
+    updateProtectedZones,
+} from './game-state';
+
 // Singleton manager
 let manager: SwarmManager | null = null;
+
+// Internal accessors for sibling modules
+export function getManager(): SwarmManager | null {
+    return manager;
+}
+
+// Track drones in attack mode (drone_id -> target position) for explosion visuals
+const attackingDrones = new Map<number, Point>();
+// Track drones in intercept mode (attacker_id -> target_drone_id)
+const interceptingDrones = new Map<number, number>();
+
+export function getAttackingDrones(): Map<number, Point> {
+    return attackingDrones;
+}
+
+export function getInterceptingDrones(): Map<number, number> {
+    return interceptingDrones;
+}
+
+/** Tracks the initial group split point (set during init) */
+let groupSplitId = 25;
+
+export function getGroupSplitId(): number {
+    return groupSplitId;
+}
 
 // Core stores
 export const isInitialized = writable(false);
@@ -22,90 +77,6 @@ export const status = writable<SwarmStatus>({
     speedMultiplier: 8.0,
     isValid: false,
 });
-
-// Explosion visual effects
-export interface Explosion {
-    x: number;
-    y: number;
-    radius: number; // in world pixel coords
-    time: number;    // timestamp when created
-}
-export const explosions = writable<Explosion[]>([]);
-
-// Blast radius: 187.5m * (4000px / 10000m) = 75px in world coords.
-const EXPLOSION_VISUAL_RADIUS = 75;
-const EXPLOSION_DURATION_MS = 800;
-
-function addExplosion(x: number, y: number): void {
-    explosions.update(list => [...list, { x, y, radius: EXPLOSION_VISUAL_RADIUS, time: Date.now() }]);
-    checkTargetDestruction(x, y, EXPLOSION_VISUAL_RADIUS);
-    setTimeout(() => {
-        explosions.update(list => list.filter(e => Date.now() - e.time < EXPLOSION_DURATION_MS));
-    }, EXPLOSION_DURATION_MS);
-}
-
-// Targets
-export interface Target {
-    id: number;
-    x: number;
-    y: number;
-    group: 'a' | 'b'; // 'a' = red (for group 1), 'b' = blue (for group 2)
-    destroyed: boolean;
-}
-
-const TARGET_SIZE = 30; // visual size in world px (half-width for hit detection)
-
-function generateTargets(): Target[] {
-    const targets: Target[] = [];
-    // Red targets ('a') near Group A's territory (top-left quadrant)
-    for (let i = 0; i < 6; i++) {
-        targets.push({
-            id: i,
-            x: 900 + Math.random() * 700,
-            y: 900 + Math.random() * 700,
-            group: 'a',
-            destroyed: false,
-        });
-    }
-    // Blue targets ('b') near Group B's territory (bottom-right quadrant)
-    for (let i = 0; i < 6; i++) {
-        targets.push({
-            id: 6 + i,
-            x: 2400 + Math.random() * 700,
-            y: 2400 + Math.random() * 700,
-            group: 'b',
-            destroyed: false,
-        });
-    }
-    return targets;
-}
-
-export const targets = writable<Target[]>(generateTargets());
-
-export const targetCounts = derived(targets, ($targets) => ({
-    a: $targets.filter(t => t.group === 'a' && !t.destroyed).length,
-    b: $targets.filter(t => t.group === 'b' && !t.destroyed).length,
-}));
-
-function checkTargetDestruction(explosionX: number, explosionY: number, blastRadius: number): void {
-    targets.update(list =>
-        list.map(t => {
-            if (t.destroyed) return t;
-            const dx = t.x - explosionX;
-            const dy = t.y - explosionY;
-            const dist = Math.sqrt(dx * dx + dy * dy);
-            // Target is hit if blast radius reaches any part of the square
-            if (dist <= blastRadius + TARGET_SIZE / 2) {
-                return { ...t, destroyed: true };
-            }
-            return t;
-        })
-    );
-}
-
-// Win condition
-export type GameResult = null | 'a_wins' | 'b_wins' | 'draw';
-export const gameResult = writable<GameResult>(null);
 
 // Path mode stores
 export const pathMode = writable(false);
@@ -151,9 +122,6 @@ export const SWARM_SIZE_COUNTS: Record<SwarmSize, number> = {
     large: 50,
 };
 
-// Hover store for tooltips
-export const hoveredDroneId = writable<number | null>(null);
-
 // Flight parameters store
 export const flightParams = writable({
     maxVelocity: 120,
@@ -176,11 +144,6 @@ export const orcaConfig = writable<OrcaConfig>({
 
 // Waypoint clearance - how close to consider "arrived"
 export const waypointClearance = writable(150.0);
-
-// Track drones in attack mode (drone_id → target position) for explosion visuals
-const attackingDrones = new Map<number, Point>();
-// Track drones in intercept mode (attacker_id → target_drone_id)
-const interceptingDrones = new Map<number, number>();
 
 // Consensus protocol for collision avoidance priority
 export type ConsensusProtocol = 'priority_by_id' | 'priority_by_waypoint_dist';
@@ -210,7 +173,56 @@ export const avoidanceLookahead = writable(1.0);
 // Derived stores
 export const selectedCount = derived(status, ($status) => $status.selectedCount);
 
-// Actions
+// ========================================================================
+// Combat Air Patrol (CAP) Strategy
+// ========================================================================
+
+/** Whether CAP mode is active */
+export const capActive = writable(false);
+
+// ---- CAP tuning knobs ----
+/** Detection radius (world px) -- enemies inside this trigger intercepts */
+const CAP_DETECT_RADIUS = 800;
+/** Minimum fraction of group that must remain patrolling */
+const CAP_MIN_PATROL_RATIO = 0.4;
+/** Max fraction of group allowed on attack runs */
+const CAP_MAX_ATTACK_RATIO = 0.3;
+/** Ticks between attack-wave decisions */
+const CAP_ATTACK_INTERVAL = 120;
+/** Ticks between recalling stale interceptors whose targets fled the zone */
+const CAP_RECALL_INTERVAL = 60;
+
+let capTickCounter = 0;
+
+/** How many drones to assign per enemy target */
+const DRONES_PER_TARGET = 2;
+/** Fraction of group to reserve for defense (patrol) */
+const DEFENSE_RESERVE = 0.4;
+
+/** Cached RL model JSON (fetched once, reused). */
+let rlModelJsonCache: string | null = null;
+
+async function loadRlModelJson(): Promise<string> {
+    if (rlModelJsonCache) return rlModelJsonCache;
+    const resp = await fetch('/models/best_model.json');
+    if (!resp.ok) throw new Error(`Failed to load RL model: ${resp.statusText}`);
+    rlModelJsonCache = await resp.text();
+    return rlModelJsonCache;
+}
+
+/** Track last known target destruction count to detect changes */
+let lastTargetDestroyedCount = 0;
+
+// ========================================================================
+// Core Actions
+// ========================================================================
+
+export function updateRenderState(): void {
+    if (!manager) return;
+    renderState.set(manager.getRenderState());
+    status.set(manager.getStatus());
+}
+
 export async function initSimulation(config?: SimulationConfig): Promise<void> {
     const finalConfig = config ?? (await loadConfig());
     manager = new SwarmManager();
@@ -245,7 +257,7 @@ export async function initSimulation(config?: SimulationConfig): Promise<void> {
     const routeA = friendlyA.length > 0 ? buildPatrolRoute(friendlyA) : ROUTE_A;
     const routeB = friendlyB.length > 0 ? buildPatrolRoute(friendlyB) : ROUTE_B;
 
-    // Assign separate routes — formation-aware (only leaders get routes)
+    // Assign separate routes -- formation-aware (only leaders get routes)
     manager.assignRouteRange(routeA, 0, halfCount);
     manager.assignRouteRange(routeB, halfCount, finalConfig.droneCount);
 
@@ -260,28 +272,6 @@ export async function initSimulation(config?: SimulationConfig): Promise<void> {
     if (defaultB !== 'none') applyStrategy(1, defaultB);
 
     updateRenderState();
-}
-
-/** Sync protected zones to WASM from current target state */
-function updateProtectedZones(): void {
-    if (!manager) return;
-    const currentTargets = get(targets);
-    const zoneA = currentTargets
-        .filter(t => t.group === 'a' && !t.destroyed)
-        .map(t => ({ x: t.x, y: t.y }));
-    const zoneB = currentTargets
-        .filter(t => t.group === 'b' && !t.destroyed)
-        .map(t => ({ x: t.x, y: t.y }));
-    manager.setProtectedZones(0, zoneA); // group 0 defends 'a' targets
-    manager.setProtectedZones(1, zoneB); // group 1 defends 'b' targets
-
-    // Update doctrine strategies with current target state
-    manager.updateDoctrineTargets(0, zoneA, zoneB); // group 0: friendly=A, enemy=B
-    manager.updateDoctrineTargets(1, zoneB, zoneA); // group 1: friendly=B, enemy=A
-
-    // Sync RL agent target counts
-    manager.updateRlTargets(0, zoneA.length, zoneB.length);
-    manager.updateRlTargets(1, zoneB.length, zoneA.length);
 }
 
 export async function reinitializeWithSize(size: SwarmSize): Promise<void> {
@@ -316,12 +306,6 @@ export async function reinitializeWithSize(size: SwarmSize): Promise<void> {
     restoreActiveRoute();
 }
 
-export function updateRenderState(): void {
-    if (!manager) return;
-    renderState.set(manager.getRenderState());
-    status.set(manager.getStatus());
-}
-
 export function tickSimulation(dt: number): void {
     if (!manager) return;
 
@@ -337,7 +321,7 @@ export function tickSimulation(dt: number): void {
     const currentDrones = manager.getRenderState();
     const currentIds = new Set(currentDrones.map(d => d.id));
 
-    // Any drone that existed before the tick but not after → explosion at last position
+    // Any drone that existed before the tick but not after -> explosion at last position
     for (const [id, pos] of dronesBefore) {
         if (!currentIds.has(id)) {
             addExplosion(pos.x, pos.y);
@@ -378,7 +362,7 @@ export function tickSimulation(dt: number): void {
         }
     }
 
-    // Check if targets changed — update protected zones + CAP routes
+    // Check if targets changed -- update protected zones + CAP routes
     {
         const destroyedNow = get(targets).filter(t => t.destroyed).length;
         if (destroyedNow !== lastTargetDestroyedCount) {
@@ -397,82 +381,9 @@ export function tickSimulation(dt: number): void {
     tickCAP();
 }
 
-/** Track last known target destruction count to detect changes */
-let lastTargetDestroyedCount = 0;
-
-function updateCAPRoutes(currentDrones: { id: number }[]): void {
-    if (!manager) return;
-    const currentTargets = get(targets);
-
-    // Rebuild patrol routes around surviving friendly targets
-    const friendlyA = currentTargets.filter(t => t.group === 'a' && !t.destroyed);
-    const friendlyB = currentTargets.filter(t => t.group === 'b' && !t.destroyed);
-
-    const patrolA = friendlyA.length > 0 ? buildPatrolRoute(friendlyA) : ROUTE_A;
-    const patrolB = friendlyB.length > 0 ? buildPatrolRoute(friendlyB) : ROUTE_B;
-
-    // Use original group split; assignRouteRange only affects drones that still exist in range
-    const totalDrones = get(status).droneCount;
-    manager.assignRouteRange(patrolA, 0, groupSplitId);
-    manager.assignRouteRange(patrolB, groupSplitId, groupSplitId + totalDrones);
-    activeRoutes.set({ a: patrolA, b: patrolB });
-    updateRenderState();
-}
-
-function checkWinCondition(currentDrones: { id: number }[]): void {
-    if (get(gameResult) !== null) return; // already decided
-
-    const currentTargets = get(targets);
-    const redTargetsAlive = currentTargets.filter(t => t.group === 'a' && !t.destroyed).length;
-    const blueTargetsAlive = currentTargets.filter(t => t.group === 'b' && !t.destroyed).length;
-
-    const groupAAlive = currentDrones.filter(d => d.id < groupSplitId).length;
-    const groupBAlive = currentDrones.filter(d => d.id >= groupSplitId).length;
-
-    // Group A wins if all blue targets destroyed OR all group B drones destroyed
-    const aWins = blueTargetsAlive === 0 || groupBAlive === 0;
-    // Group B wins if all red targets destroyed OR all group A drones destroyed
-    const bWins = redTargetsAlive === 0 || groupAAlive === 0;
-
-    if (aWins && bWins) {
-        gameResult.set('draw');
-    } else if (aWins) {
-        gameResult.set('a_wins');
-    } else if (bWins) {
-        gameResult.set('b_wins');
-    }
-}
-
-export function selectDrone(id: number, multi: boolean): void {
-    manager?.selectDrone(id, multi);
-    updateRenderState();
-}
-
-export function selectDronesInRect(minX: number, minY: number, maxX: number, maxY: number, multi: boolean): void {
-    if (!manager) return;
-
-    // Get current render state to find drones in the rectangle
-    const state = manager.getRenderState();
-
-    // If not multi-select, clear first
-    if (!multi) {
-        manager.clearSelection();
-    }
-
-    // Select all drones within the rectangle
-    for (const drone of state) {
-        if (drone.x >= minX && drone.x <= maxX && drone.y >= minY && drone.y <= maxY) {
-            manager.selectDrone(drone.id, true); // Always multi=true to add to selection
-        }
-    }
-
-    updateRenderState();
-}
-
-export function clearSelection(): void {
-    manager?.clearSelection();
-    updateRenderState();
-}
+// ========================================================================
+// Combat Actions
+// ========================================================================
 
 export function detonateDrone(droneId: number): void {
     if (!manager) return;
@@ -534,32 +445,13 @@ export function returnToFormation(droneId: number): void {
 // Group Strategy
 // ========================================================================
 
-/** How many drones to assign per enemy target */
-const DRONES_PER_TARGET = 2;
-/** Fraction of group to reserve for defense (patrol) */
-const DEFENSE_RESERVE = 0.4;
-
-/** Tracks the initial group split point (set during init) */
-let groupSplitId = 25;
-
-/** Cached RL model JSON (fetched once, reused). */
-let rlModelJsonCache: string | null = null;
-
-async function loadRlModelJson(): Promise<string> {
-    if (rlModelJsonCache) return rlModelJsonCache;
-    const resp = await fetch('/models/best_model.json');
-    if (!resp.ok) throw new Error(`Failed to load RL model: ${resp.statusText}`);
-    rlModelJsonCache = await resp.text();
-    return rlModelJsonCache;
-}
-
 /**
  * Assign multiple drones from a group to attack all surviving enemy targets.
  * Distributes drones evenly across targets, respecting a defense reserve.
  */
 function assignGroupAttackers(
     groupDrones: { id: number; x: number; y: number }[],
-    enemyTargets: Target[],
+    enemyTargets: { id: number; x: number; y: number; group: 'a' | 'b'; destroyed: boolean }[],
 ): void {
     if (enemyTargets.length === 0 || groupDrones.length === 0) return;
 
@@ -591,7 +483,7 @@ function assignGroupAttackers(
     }
 }
 
-/** Launch a coordinated attack wave — each group sends drones to enemy targets. */
+/** Launch a coordinated attack wave -- each group sends drones to enemy targets. */
 export function launchAttack(): void {
     if (!manager) return;
     const drones = manager.getRenderState();
@@ -609,114 +501,16 @@ export function launchAttack(): void {
 }
 
 // ========================================================================
-// Combat Air Patrol (CAP) Strategy
+// CAP Helpers
 // ========================================================================
-
-/** Whether CAP mode is active */
-export const capActive = writable(false);
-
-// ---- CAP tuning knobs ----
-/** Detection radius (world px) — enemies inside this trigger intercepts */
-const CAP_DETECT_RADIUS = 800;
-/** Standoff distance (px) for patrol waypoints around friendly targets */
-const CAP_PATROL_STANDOFF = 200;
-/** Minimum fraction of group that must remain patrolling */
-const CAP_MIN_PATROL_RATIO = 0.4;
-/** Max fraction of group allowed on attack runs */
-const CAP_MAX_ATTACK_RATIO = 0.3;
-/** Ticks between attack-wave decisions */
-const CAP_ATTACK_INTERVAL = 120;
-/** Ticks between recalling stale interceptors whose targets fled the zone */
-const CAP_RECALL_INTERVAL = 60;
-
-let capTickCounter = 0;
-
-/**
- * Compute the convex hull of a set of points (Andrew's monotone chain).
- * Returns points in counter-clockwise order.
- */
-function convexHull(points: Point[]): Point[] {
-    if (points.length <= 1) return [...points];
-
-    const sorted = [...points].sort((a, b) => a.x - b.x || a.y - b.y);
-    const n = sorted.length;
-
-    // Cross product of vectors OA and OB where O is origin
-    const cross = (o: Point, a: Point, b: Point) =>
-        (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x);
-
-    // Lower hull
-    const lower: Point[] = [];
-    for (const p of sorted) {
-        while (lower.length >= 2 && cross(lower[lower.length - 2], lower[lower.length - 1], p) <= 0)
-            lower.pop();
-        lower.push(p);
-    }
-
-    // Upper hull
-    const upper: Point[] = [];
-    for (let i = n - 1; i >= 0; i--) {
-        const p = sorted[i];
-        while (upper.length >= 2 && cross(upper[upper.length - 2], upper[upper.length - 1], p) <= 0)
-            upper.pop();
-        upper.push(p);
-    }
-
-    // Remove last point of each half because it's repeated
-    lower.pop();
-    upper.pop();
-    return [...lower, ...upper];
-}
-
-/**
- * Build a convex patrol route around a set of targets.
- * Computes convex hull of target positions, then pushes each vertex
- * outward by CAP_PATROL_STANDOFF from the centroid.
- */
-function buildPatrolRoute(friendlyTargets: Target[]): Point[] {
-    if (friendlyTargets.length === 0) return [];
-
-    const targetPoints = friendlyTargets.map(t => ({ x: t.x, y: t.y }));
-
-    // For 1-2 targets, create a simple polygon around them
-    if (targetPoints.length <= 2) {
-        const cx = targetPoints.reduce((s, p) => s + p.x, 0) / targetPoints.length;
-        const cy = targetPoints.reduce((s, p) => s + p.y, 0) / targetPoints.length;
-        // Generate a square/hexagon around the centroid
-        const count = 4;
-        const route: Point[] = [];
-        for (let i = 0; i < count; i++) {
-            const angle = (i / count) * Math.PI * 2;
-            route.push({
-                x: cx + CAP_PATROL_STANDOFF * Math.cos(angle),
-                y: cy + CAP_PATROL_STANDOFF * Math.sin(angle),
-            });
-        }
-        return route;
-    }
-
-    const hull = convexHull(targetPoints);
-    const cx = hull.reduce((s, p) => s + p.x, 0) / hull.length;
-    const cy = hull.reduce((s, p) => s + p.y, 0) / hull.length;
-
-    return hull.map(p => {
-        const dx = p.x - cx;
-        const dy = p.y - cy;
-        const dist = Math.sqrt(dx * dx + dy * dy) || 1;
-        return {
-            x: p.x + (dx / dist) * CAP_PATROL_STANDOFF,
-            y: p.y + (dy / dist) * CAP_PATROL_STANDOFF,
-        };
-    });
-}
 
 interface GroupState {
     drones: { id: number; x: number; y: number }[];
     patrolling: { id: number; x: number; y: number }[];
     attacking: { id: number; x: number; y: number }[];
     intercepting: { id: number; x: number; y: number }[];
-    friendlyTargets: Target[];
-    enemyTargets: Target[];
+    friendlyTargets: { id: number; x: number; y: number; group: 'a' | 'b'; destroyed: boolean }[];
+    enemyTargets: { id: number; x: number; y: number; group: 'a' | 'b'; destroyed: boolean }[];
     center: Point;
     groupStart: number;
     groupEnd: number;
@@ -725,7 +519,7 @@ interface GroupState {
 
 function buildGroupState(
     drones: { id: number; x: number; y: number }[],
-    currentTargets: Target[],
+    currentTargets: { id: number; x: number; y: number; group: 'a' | 'b'; destroyed: boolean }[],
     friendlyGroup: 'a' | 'b',
     idStart: number,
     idEnd: number,
@@ -848,6 +642,25 @@ function capDecideGroup(
     }
 }
 
+function updateCAPRoutes(currentDrones: { id: number }[]): void {
+    if (!manager) return;
+    const currentTargets = get(targets);
+
+    // Rebuild patrol routes around surviving friendly targets
+    const friendlyA = currentTargets.filter(t => t.group === 'a' && !t.destroyed);
+    const friendlyB = currentTargets.filter(t => t.group === 'b' && !t.destroyed);
+
+    const patrolA = friendlyA.length > 0 ? buildPatrolRoute(friendlyA) : ROUTE_A;
+    const patrolB = friendlyB.length > 0 ? buildPatrolRoute(friendlyB) : ROUTE_B;
+
+    // Use original group split; assignRouteRange only affects drones that still exist in range
+    const totalDrones = get(status).droneCount;
+    manager.assignRouteRange(patrolA, 0, groupSplitId);
+    manager.assignRouteRange(patrolB, groupSplitId, groupSplitId + totalDrones);
+    activeRoutes.set({ a: patrolA, b: patrolB });
+    updateRenderState();
+}
+
 function tickCAP(): void {
     if (!manager || !get(capActive)) return;
     capTickCounter++;
@@ -888,7 +701,7 @@ export function toggleCAP(): void {
     const endId = groupSplitId * 2;
 
     if (!wasActive) {
-        // Activating CAP — build patrol routes around friendly targets
+        // Activating CAP -- build patrol routes around friendly targets
         const currentTargets = get(targets);
         const friendlyA = currentTargets.filter(t => t.group === 'a' && !t.destroyed);
         const friendlyB = currentTargets.filter(t => t.group === 'b' && !t.destroyed);
@@ -903,13 +716,17 @@ export function toggleCAP(): void {
         activeRoutes.set({ a: patrolA, b: patrolB });
         updateRenderState();
     } else {
-        // Deactivating CAP — restore original patrol routes
+        // Deactivating CAP -- restore original patrol routes
         manager.assignRouteRange(ROUTE_A, 0, groupSplitId);
         manager.assignRouteRange(ROUTE_B, groupSplitId, endId);
         activeRoutes.set({ a: ROUTE_A, b: ROUTE_B });
         updateRenderState();
     }
 }
+
+// ========================================================================
+// Navigation & Config Actions
+// ========================================================================
 
 export function setSpeed(speed: number): void {
     manager?.setSpeed(speed);
@@ -943,10 +760,6 @@ export function assignRouteAll(waypoints: Point[]): void {
     // Keep path visible in route mode (don't clear)
     pathMode.set(false);
     updateRenderState();
-}
-
-export function getDroneAt(x: number, y: number): number | undefined {
-    return manager?.getDroneAt(x, y, 20);
 }
 
 export function resetSimulation(): void {
@@ -1094,7 +907,7 @@ function applyStrategy(group: 0 | 1, strategy: StrategyType): void {
             manager.setStrategyDefendArea(droneIds, center.x, center.y, 600);
             break;
         case 'attack_zone': {
-            // Attack enemy targets — pass their positions directly
+            // Attack enemy targets -- pass their positions directly
             const targetPositions = enemyTargets.map(t => ({ x: t.x, y: t.y }));
             if (targetPositions.length === 0) break;
             manager.setStrategyAttackZone(droneIds, targetPositions);
@@ -1130,7 +943,6 @@ function applyStrategy(group: 0 | 1, strategy: StrategyType): void {
             manager.setDoctrine(droneIds, friendlyPositions, enemyPositions, patrolWaypoints, 'defensive');
 
             // Load RL model asynchronously
-            const otherGroup = group === 0 ? 'b' : 'a';
             const initialOwnDrones = droneIds.length;
             const otherDrones = drones.filter(d =>
                 group === 0 ? d.id >= groupSplitId : d.id < groupSplitId

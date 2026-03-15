@@ -21,6 +21,7 @@ mod test_utils;
 
 pub mod agent;
 pub mod behaviors;
+pub mod game;
 pub mod messages;
 pub mod missions;
 pub mod doctrine;

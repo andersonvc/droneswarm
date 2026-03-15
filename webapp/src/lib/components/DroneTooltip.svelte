@@ -1,4 +1,5 @@
 <script lang="ts">
+    import { onMount } from 'svelte';
     import { hoveredDroneId, renderState } from '$lib/stores/simulation';
 
     interface Props {
@@ -8,15 +9,28 @@
 
     let { x, y }: Props = $props();
 
+    let isTouchDevice = $state(false);
+
+    onMount(() => {
+        isTouchDevice = 'ontouchstart' in window;
+    });
+
     let drone = $derived(
         $hoveredDroneId !== null
             ? $renderState.find((d) => d.id === $hoveredDroneId)
             : null
     );
+
+    let tooltipLeft = $derived(
+        Math.min(x + 20, (typeof window !== 'undefined' ? window.innerWidth : 1000) - 220)
+    );
+    let tooltipTop = $derived(
+        Math.max(y - 10, 10)
+    );
 </script>
 
-{#if drone}
-    <div class="tooltip" style="left: {x + 20}px; top: {y - 10}px;">
+{#if drone && !isTouchDevice}
+    <div class="tooltip" style="left: {tooltipLeft}px; top: {tooltipTop}px;">
         <div class="tooltip-header">Drone #{drone.id}</div>
         <div class="tooltip-row">
             <span class="label">Status</span>

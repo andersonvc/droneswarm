@@ -8,20 +8,30 @@
         coordinationMode,
         objectiveMode,
         hoveredDroneId,
-        selectDrone,
-        clearSelection,
         assignWaypoint,
         assignWaypointAll,
         assignPath,
         assignRouteAll,
         getDroneAt,
-        selectDronesInRect,
         activeRoutes,
         explosions,
         targets,
         targetCounts,
         gameResult,
     } from '$lib/stores/simulation';
+
+    // Renderers
+    import { drawGrid } from './renderers/grid';
+    import { drawDrone, drawWaypointMarkers } from './renderers/drones';
+    import { drawRoutePath, drawSplinePath, drawPlanningPath, drawPathWaypoints, drawGroupRoute } from './renderers/paths';
+    import { drawTarget, drawTargetScore } from './renderers/targets';
+    import { drawExplosion, drawSelectionBox } from './renderers/effects';
+    import { drawZoomIndicator, drawWinBanner } from './renderers/hud';
+
+    // Input helpers
+    import { screenToWorld, computeWheelZoom } from './input/camera';
+    import { DRAG_THRESHOLD, handleBoxSelection, handleClickSelection } from './input/selection';
+    import { handlePathClick } from './input/path-placement';
 
     let { width = 1000, height = 1000, worldWidth = 4000, worldHeight = 4000 } = $props();
 
@@ -32,7 +42,6 @@
     let isDragging = $state(false);
     let dragStart = $state({ x: 0, y: 0 });
     let dragEnd = $state({ x: 0, y: 0 });
-    const DRAG_THRESHOLD = 5; // Minimum pixels to consider a drag
 
     // Zoom and pan state
     let zoom = $state(0.25);
@@ -40,44 +49,42 @@
     let panY = $state(0);
     let isPanning = $state(false);
     let panStart = $state({ x: 0, y: 0 });
-    const MIN_ZOOM = 0.1;
-    const MAX_ZOOM = 4.0;
-    const ZOOM_SENSITIVITY = 0.001;
 
-    // Convert screen coordinates to world coordinates
-    function screenToWorld(screenX: number, screenY: number): { x: number; y: number } {
-        return {
-            x: (screenX - panX) / zoom,
-            y: (screenY - panY) / zoom
-        };
+    // Touch interaction state
+    let lastTouchDist = $state(0);
+    let touchStartTime = $state(0);
+    let touchStartPos = $state({ x: 0, y: 0 });
+    let longPressTimer: ReturnType<typeof setTimeout> | null = null;
+    let isTouchPanning = $state(false);
+    let touchPanStart = $state({ x: 0, y: 0 });
+
+    function applyDpiScaling() {
+        if (!canvas || !ctx) return;
+        const dpr = window.devicePixelRatio || 1;
+        canvas.width = width * dpr;
+        canvas.height = height * dpr;
+        canvas.style.width = width + 'px';
+        canvas.style.height = height + 'px';
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        ctx.scale(dpr, dpr);
     }
-
-    // Convert world coordinates to screen coordinates
-    function worldToScreen(worldX: number, worldY: number): { x: number; y: number } {
-        return {
-            x: worldX * zoom + panX,
-            y: worldY * zoom + panY
-        };
-    }
-
-    const GRID_SPACING = 100;
-    const GRID_OPACITY = 0.08;
-    const DRONE_HEIGHT = 15;
-    const DRONE_WIDTH = 5;
-    const SELECTION_RADIUS = 20;
-    const WAYPOINT_RADIUS = 8;
-    const COLLISION_RADIUS = 1; // Half of COLLISION_DISTANCE (30) from wasm-lib
-
-    // Shield AI color palette
-    const LIME_ACCENT = '#9DFF20';
-    const LIME_GLOW = 'rgba(157, 255, 32, 0.3)';
-    const LIME_DIM = 'rgba(157, 255, 32, 0.5)';
-    const OLIVE = '#345C00';
-    const CANVAS_BG = '#0a0a0f';
 
     onMount(() => {
         ctx = canvas.getContext('2d')!;
-        render();
+        applyDpiScaling();
+        // Defer fitToView so renderState is populated
+        requestAnimationFrame(() => fitToView());
+    });
+
+    // Re-apply DPI scaling when canvas dimensions change
+    $effect(() => {
+        // Access width and height to track them
+        void width;
+        void height;
+        if (ctx) {
+            applyDpiScaling();
+            render();
+        }
     });
 
     // Re-render when state changes
@@ -118,490 +125,41 @@
         ctx.translate(panX, panY);
         ctx.scale(zoom, zoom);
 
-        // Draw grid
-        drawGrid();
+        drawGrid(ctx, worldWidth, worldHeight);
 
-        // Draw targets
         for (const target of $targets) {
-            if (!target.destroyed) drawTarget(target);
+            if (!target.destroyed) drawTarget(ctx, target);
         }
 
-        // Draw waypoint markers for ALL drones with targets
-        drawWaypointMarkers();
-
-        // Draw path/route waypoints (show in path mode OR when route mode has waypoints)
-        if ($pathMode && $currentPath.length > 0) {
-            drawPathWaypoints();
-        } else if ($objectiveMode === 'route') {
-            // Draw both group routes with distinct colors
-            const routes = $activeRoutes;
-            if (routes.a.length > 0) drawGroupRoute(routes.a, 'rgba(157, 255, 32, 0.5)', OLIVE);
-            if (routes.b.length > 0) drawGroupRoute(routes.b, 'rgba(0, 180, 255, 0.5)', 'rgba(0, 90, 128, 1.0)');
-        }
-
-        // Draw full route paths for all drones in route mode
-        for (const drone of $renderState) {
-            if (drone.routePath && drone.routePath.length > 1) {
-                drawRoutePath(drone.routePath, drone.color);
-            }
-        }
-
-        // Draw spline paths for drones in route mode
-        for (const drone of $renderState) {
-            if (drone.splinePath && drone.splinePath.length > 1) {
-                drawSplinePath(drone.splinePath);
-            }
-        }
-
-        // Draw planning paths (NLGL trajectory) for formation followers
         for (const drone of $renderState) {
             if (drone.planningPath && drone.planningPath.length > 1) {
-                drawPlanningPath(drone.planningPath, drone.approachMode);
+                drawPlanningPath(ctx, drone.planningPath, drone.approachMode);
             }
         }
 
-        // Draw drones
         for (const drone of $renderState) {
-            drawDrone(drone);
+            drawDrone(ctx, drone);
         }
 
-        // Draw explosion effects (in world space, before restore)
         for (const explosion of $explosions) {
-            drawExplosion(explosion);
+            drawExplosion(ctx, explosion);
         }
 
-        // Restore transform before drawing UI elements (selection box is in screen space)
         ctx.restore();
 
-        // Draw selection box if dragging (in screen space)
         if (isDragging) {
-            drawSelectionBox();
+            drawSelectionBox(ctx, dragStart, dragEnd);
         }
 
-        // Draw zoom indicator
         if (zoom !== 1.0) {
-            drawZoomIndicator();
+            drawZoomIndicator(ctx, zoom, width, height);
         }
 
-        // Draw target score
-        drawTargetScore();
+        drawTargetScore(ctx, $targetCounts);
 
-        // Draw win banner if game is over
         if ($gameResult) {
-            drawWinBanner();
+            drawWinBanner(ctx, $gameResult, width, height);
         }
-    }
-
-    function drawZoomIndicator() {
-        if (!ctx) return;
-        const zoomText = `${Math.round(zoom * 100)}%`;
-        ctx.fillStyle = 'rgba(157, 255, 32, 0.8)';
-        ctx.font = '12px "IBM Plex Mono", monospace';
-        ctx.textAlign = 'right';
-        ctx.textBaseline = 'bottom';
-        ctx.fillText(zoomText, width - 10, height - 10);
-    }
-
-    function drawTarget(target: { x: number; y: number; group: 'a' | 'b' }) {
-        if (!ctx) return;
-        const size = 30;
-        const half = size / 2;
-        const color = target.group === 'a' ? 'rgba(255, 60, 60, 0.8)' : 'rgba(60, 140, 255, 0.8)';
-        const border = target.group === 'a' ? 'rgba(255, 120, 120, 1)' : 'rgba(120, 180, 255, 1)';
-
-        ctx.fillStyle = color;
-        ctx.fillRect(target.x - half, target.y - half, size, size);
-        ctx.strokeStyle = border;
-        ctx.lineWidth = 2;
-        ctx.strokeRect(target.x - half, target.y - half, size, size);
-    }
-
-    function drawTargetScore() {
-        if (!ctx) return;
-        const counts = $targetCounts;
-        ctx.font = 'bold 14px "IBM Plex Mono", monospace';
-        ctx.textAlign = 'left';
-        ctx.textBaseline = 'top';
-
-        // Red targets remaining (group A)
-        ctx.fillStyle = 'rgba(255, 60, 60, 0.9)';
-        ctx.fillText(`RED targets: ${counts.a}/6`, 10, 10);
-
-        // Blue targets remaining (group B)
-        ctx.fillStyle = 'rgba(60, 140, 255, 0.9)';
-        ctx.fillText(`BLU targets: ${counts.b}/6`, 10, 30);
-    }
-
-    function drawWinBanner() {
-        if (!ctx) return;
-        const result = $gameResult;
-        let text = '';
-        let color = '';
-        if (result === 'a_wins') {
-            text = 'RED TEAM WINS';
-            color = 'rgba(255, 60, 60, 0.95)';
-        } else if (result === 'b_wins') {
-            text = 'BLUE TEAM WINS';
-            color = 'rgba(60, 140, 255, 0.95)';
-        } else if (result === 'draw') {
-            text = 'DRAW';
-            color = 'rgba(200, 200, 200, 0.95)';
-        }
-
-        // Darken background
-        ctx.fillStyle = 'rgba(0, 0, 0, 0.5)';
-        ctx.fillRect(0, 0, width, height);
-
-        // Banner
-        const bannerH = 80;
-        const bannerY = height / 2 - bannerH / 2;
-        ctx.fillStyle = 'rgba(10, 10, 15, 0.9)';
-        ctx.fillRect(0, bannerY, width, bannerH);
-
-        // Text
-        ctx.font = 'bold 36px "IBM Plex Mono", monospace';
-        ctx.textAlign = 'center';
-        ctx.textBaseline = 'middle';
-        ctx.fillStyle = color;
-        ctx.fillText(text, width / 2, height / 2);
-    }
-
-    function drawGrid() {
-        if (!ctx) return;
-        ctx.strokeStyle = `rgba(157, 255, 32, ${GRID_OPACITY})`;
-        ctx.lineWidth = 1;
-
-        for (let x = GRID_SPACING; x < worldWidth; x += GRID_SPACING) {
-            ctx.beginPath();
-            ctx.moveTo(x, 0);
-            ctx.lineTo(x, worldHeight);
-            ctx.stroke();
-        }
-
-        for (let y = GRID_SPACING; y < worldHeight; y += GRID_SPACING) {
-            ctx.beginPath();
-            ctx.moveTo(0, y);
-            ctx.lineTo(worldWidth, y);
-            ctx.stroke();
-        }
-    }
-
-    function drawRoutePath(points: { x: number; y: number }[], color: { r: number; g: number; b: number }) {
-        if (!ctx || points.length < 2) return;
-
-        ctx.strokeStyle = `rgba(${color.r}, ${color.g}, ${color.b}, 0.4)`;
-        ctx.lineWidth = 1.5;
-        ctx.setLineDash([4, 4]);
-
-        // Points are already densely sampled Hermite spline from WASM
-        ctx.beginPath();
-        ctx.moveTo(points[0].x, points[0].y);
-        for (let i = 1; i < points.length; i++) {
-            ctx.lineTo(points[i].x, points[i].y);
-        }
-        // Close the loop
-        ctx.lineTo(points[0].x, points[0].y);
-
-        ctx.stroke();
-        ctx.setLineDash([]);
-    }
-
-    function drawSplinePath(points: { x: number; y: number }[]) {
-        if (!ctx || points.length < 2) return;
-
-        ctx.strokeStyle = 'rgba(255, 0, 0, 0.7)'; // 70% translucent red
-        ctx.lineWidth = 2;
-        ctx.setLineDash([8, 4]); // Dashed line
-
-        ctx.beginPath();
-        ctx.moveTo(points[0].x, points[0].y);
-
-        for (let i = 1; i < points.length; i++) {
-            ctx.lineTo(points[i].x, points[i].y);
-        }
-
-        ctx.stroke();
-        ctx.setLineDash([]); // Reset dash
-    }
-
-    function drawPlanningPath(points: { x: number; y: number }[], approachMode: string) {
-        if (!ctx || points.length < 2) return;
-
-        // Color based on approach mode:
-        // - "approach": Yellow (gated spline approach)
-        // - "pursuit": Cyan/Blue (lead pursuit)
-        // - "correction": Green (close correction)
-        // - "station_keeping": No path (but if shown, also green)
-        // - "none": Skip (leader or not in formation)
-        let color: string;
-        switch (approachMode) {
-            case 'approach':
-                color = 'rgba(255, 220, 0, 0.7)'; // Yellow
-                break;
-            case 'pursuit':
-                color = 'rgba(0, 180, 255, 0.7)'; // Cyan/Blue
-                break;
-            case 'correction':
-            case 'station_keeping':
-                color = 'rgba(0, 255, 100, 0.7)'; // Green
-                break;
-            default:
-                return; // Don't draw for "none" or unknown modes
-        }
-
-        ctx.strokeStyle = color;
-        ctx.lineWidth = 2;
-        ctx.setLineDash([6, 4]); // Dashed line
-
-        ctx.beginPath();
-        ctx.moveTo(points[0].x, points[0].y);
-
-        for (let i = 1; i < points.length; i++) {
-            ctx.lineTo(points[i].x, points[i].y);
-        }
-
-        ctx.stroke();
-        ctx.setLineDash([]); // Reset dash
-    }
-
-    function drawWaypointMarkers() {
-        if (!ctx) return;
-
-        // Collect unique waypoints and their associated drones
-        const waypointMap = new Map<string, { x: number; y: number; drones: typeof $renderState }>();
-
-        for (const drone of $renderState) {
-            if (drone.target) {
-                const key = `${drone.target.x.toFixed(0)},${drone.target.y.toFixed(0)}`;
-                if (!waypointMap.has(key)) {
-                    waypointMap.set(key, { x: drone.target.x, y: drone.target.y, drones: [] });
-                }
-                waypointMap.get(key)!.drones.push(drone);
-            }
-        }
-
-        // Draw lines from each drone to its waypoint
-        for (const drone of $renderState) {
-            if (drone.target) {
-                ctx.strokeStyle = drone.selected ? 'rgba(157, 255, 32, 0.6)' : 'rgba(157, 255, 32, 0.25)';
-                ctx.lineWidth = drone.selected ? 2 : 1;
-                ctx.setLineDash([5, 5]);
-                ctx.beginPath();
-                ctx.moveTo(drone.x, drone.y);
-                ctx.lineTo(drone.target.x, drone.target.y);
-                ctx.stroke();
-                ctx.setLineDash([]);
-            }
-        }
-
-        // Draw waypoint markers
-        for (const [, waypoint] of waypointMap) {
-            const { x, y, drones } = waypoint;
-            const hasSelectedDrone = drones.some(d => d.selected);
-
-            // Outer ring
-            ctx.strokeStyle = hasSelectedDrone ? LIME_ACCENT : LIME_DIM;
-            ctx.lineWidth = hasSelectedDrone ? 3 : 2;
-            ctx.beginPath();
-            ctx.arc(x, y, WAYPOINT_RADIUS + 4, 0, Math.PI * 2);
-            ctx.stroke();
-
-            // Inner filled circle
-            ctx.fillStyle = hasSelectedDrone ? LIME_ACCENT : LIME_DIM;
-            ctx.beginPath();
-            ctx.arc(x, y, WAYPOINT_RADIUS, 0, Math.PI * 2);
-            ctx.fill();
-
-            // Drone count badge if multiple drones
-            if (drones.length > 1) {
-                ctx.fillStyle = '#0a0a0f';
-                ctx.font = 'bold 10px "IBM Plex Mono", monospace';
-                ctx.textAlign = 'center';
-                ctx.textBaseline = 'middle';
-                ctx.fillText(String(drones.length), x, y);
-            }
-        }
-    }
-
-    function drawPathWaypoints() {
-        if (!ctx) return;
-        const isRoute = $objectiveMode === 'route';
-        const isPlacing = $pathMode;
-
-        // Use lime green for paths/routes
-        const pointColor = isRoute && !isPlacing ? 'rgba(157, 255, 32, 0.5)' : LIME_ACCENT;
-        const lineColor = isRoute && !isPlacing ? OLIVE : LIME_ACCENT;
-
-        ctx.lineWidth = 2;
-
-        // Connect with lines first (behind dots)
-        if ($currentPath.length > 1) {
-            ctx.strokeStyle = lineColor;
-            ctx.setLineDash(isRoute ? [5, 5] : []);
-            ctx.beginPath();
-            ctx.moveTo($currentPath[0].x, $currentPath[0].y);
-            for (let i = 1; i < $currentPath.length; i++) {
-                ctx.lineTo($currentPath[i].x, $currentPath[i].y);
-            }
-            // If route mode, connect back to start
-            if (isRoute && $currentPath.length > 2) {
-                ctx.lineTo($currentPath[0].x, $currentPath[0].y);
-            }
-            ctx.stroke();
-            ctx.setLineDash([]);
-        }
-
-        // Draw waypoint dots with numbers
-        for (let i = 0; i < $currentPath.length; i++) {
-            const { x, y } = $currentPath[i];
-
-            // Draw circle
-            ctx.fillStyle = pointColor;
-            ctx.beginPath();
-            ctx.arc(x, y, 12, 0, Math.PI * 2);
-            ctx.fill();
-
-            // Number label
-            ctx.fillStyle = isRoute && !isPlacing ? 'rgba(10, 10, 15, 0.6)' : '#0a0a0f';
-            ctx.font = 'bold 12px "IBM Plex Mono", monospace';
-            ctx.textAlign = 'center';
-            ctx.textBaseline = 'middle';
-            ctx.fillText(String(i + 1), x, y);
-        }
-    }
-
-    function drawGroupRoute(waypoints: { x: number; y: number }[], pointColor: string, lineColor: string) {
-        if (!ctx || waypoints.length === 0) return;
-
-        ctx.lineWidth = 2;
-
-        // Connect with dashed lines
-        if (waypoints.length > 1) {
-            ctx.strokeStyle = lineColor;
-            ctx.setLineDash([5, 5]);
-            ctx.beginPath();
-            ctx.moveTo(waypoints[0].x, waypoints[0].y);
-            for (let i = 1; i < waypoints.length; i++) {
-                ctx.lineTo(waypoints[i].x, waypoints[i].y);
-            }
-            if (waypoints.length > 2) {
-                ctx.lineTo(waypoints[0].x, waypoints[0].y);
-            }
-            ctx.stroke();
-            ctx.setLineDash([]);
-        }
-
-        // Draw waypoint dots with numbers
-        for (let i = 0; i < waypoints.length; i++) {
-            const { x, y } = waypoints[i];
-            ctx.fillStyle = pointColor;
-            ctx.beginPath();
-            ctx.arc(x, y, 12, 0, Math.PI * 2);
-            ctx.fill();
-
-            ctx.fillStyle = 'rgba(10, 10, 15, 0.6)';
-            ctx.font = 'bold 12px "IBM Plex Mono", monospace';
-            ctx.textAlign = 'center';
-            ctx.textBaseline = 'middle';
-            ctx.fillText(String(i + 1), x, y);
-        }
-    }
-
-    function drawExplosion(explosion: { x: number; y: number; radius: number; time: number }) {
-        if (!ctx) return;
-        const elapsed = Date.now() - explosion.time;
-        const duration = 800;
-        if (elapsed >= duration) return;
-
-        // Fade out over duration
-        const progress = elapsed / duration;
-        const alpha = 1.0 - progress;
-
-        // Expanding ring effect
-        const currentRadius = explosion.radius * (0.5 + 0.5 * progress);
-
-        ctx.strokeStyle = `rgba(255, 40, 40, ${alpha})`;
-        ctx.lineWidth = 2;
-        ctx.setLineDash([6, 4]);
-        ctx.beginPath();
-        ctx.arc(explosion.x, explosion.y, currentRadius, 0, Math.PI * 2);
-        ctx.stroke();
-        ctx.setLineDash([]);
-
-        // Inner glow fill
-        ctx.fillStyle = `rgba(255, 60, 20, ${alpha * 0.15})`;
-        ctx.beginPath();
-        ctx.arc(explosion.x, explosion.y, currentRadius, 0, Math.PI * 2);
-        ctx.fill();
-    }
-
-    function drawDrone(drone: typeof $renderState[0]) {
-        if (!ctx) return;
-        const { x, y, heading, color, selected } = drone;
-
-        const cosH = Math.cos(heading);
-        const sinH = Math.sin(heading);
-
-        const tipX = x + cosH * (DRONE_HEIGHT / 2);
-        const tipY = y + sinH * (DRONE_HEIGHT / 2);
-
-        const backLeftX = x - cosH * (DRONE_HEIGHT / 2) - sinH * (DRONE_WIDTH / 2);
-        const backLeftY = y - sinH * (DRONE_HEIGHT / 2) + cosH * (DRONE_WIDTH / 2);
-
-        const backRightX = x - cosH * (DRONE_HEIGHT / 2) + sinH * (DRONE_WIDTH / 2);
-        const backRightY = y - sinH * (DRONE_HEIGHT / 2) - cosH * (DRONE_WIDTH / 2);
-
-        // Draw collision boundary (dashed circle, white 10% opacity)
-        ctx.strokeStyle = 'rgba(255, 255, 255, 0.4)';
-        ctx.lineWidth = 1;
-        ctx.setLineDash([4, 4]);
-        ctx.beginPath();
-        ctx.arc(x, y, COLLISION_RADIUS, 0, Math.PI * 2);
-        ctx.stroke();
-        ctx.setLineDash([]);
-
-        if (selected) {
-            // Lime green selection ring with glow
-            ctx.shadowColor = LIME_ACCENT;
-            ctx.shadowBlur = 12;
-            ctx.strokeStyle = LIME_ACCENT;
-            ctx.lineWidth = 2;
-            ctx.beginPath();
-            ctx.arc(x, y, SELECTION_RADIUS, 0, Math.PI * 2);
-            ctx.stroke();
-            ctx.shadowBlur = 0;
-        }
-
-        ctx.fillStyle = `rgb(${color.r}, ${color.g}, ${color.b})`;
-        ctx.strokeStyle = 'rgba(255, 255, 255, 0.8)';
-        ctx.lineWidth = 1;
-        ctx.beginPath();
-        ctx.moveTo(tipX, tipY);
-        ctx.lineTo(backLeftX, backLeftY);
-        ctx.lineTo(backRightX, backRightY);
-        ctx.closePath();
-        ctx.fill();
-        ctx.stroke();
-    }
-
-    function drawSelectionBox() {
-        if (!ctx) return;
-
-        const x = Math.min(dragStart.x, dragEnd.x);
-        const y = Math.min(dragStart.y, dragEnd.y);
-        const w = Math.abs(dragEnd.x - dragStart.x);
-        const h = Math.abs(dragEnd.y - dragStart.y);
-
-        // Fill
-        ctx.fillStyle = 'rgba(157, 255, 32, 0.1)';
-        ctx.fillRect(x, y, w, h);
-
-        // Border
-        ctx.strokeStyle = LIME_ACCENT;
-        ctx.lineWidth = 2;
-        ctx.setLineDash([5, 5]);
-        ctx.strokeRect(x, y, w, h);
-        ctx.setLineDash([]);
     }
 
     function handleMouseDown(e: MouseEvent) {
@@ -617,8 +175,8 @@
             return;
         }
 
-        if (e.button !== 0) return; // Left click only for other actions
-        if ($pathMode) return; // No box selection in path mode
+        if (e.button !== 0) return;
+        if ($pathMode) return;
 
         dragStart = { x: screenX, y: screenY };
         dragEnd = { x: screenX, y: screenY };
@@ -629,7 +187,6 @@
         const screenX = e.clientX - rect.left;
         const screenY = e.clientY - rect.top;
 
-        // Handle panning
         if (isPanning) {
             panX = screenX - panStart.x;
             panY = screenY - panStart.y;
@@ -637,13 +194,11 @@
             return;
         }
 
-        // Update hover state (convert to world coordinates)
-        const world = screenToWorld(screenX, screenY);
+        const world = screenToWorld(screenX, screenY, panX, panY, zoom);
         const droneId = getDroneAt(world.x, world.y);
         hoveredDroneId.set(droneId ?? null);
 
-        // Handle dragging for box selection
-        if (e.buttons === 1 && !$pathMode && !e.ctrlKey) { // Left mouse button held, not panning
+        if (e.buttons === 1 && !$pathMode && !e.ctrlKey) {
             const dx = Math.abs(screenX - dragStart.x);
             const dy = Math.abs(screenY - dragStart.y);
 
@@ -659,7 +214,6 @@
     }
 
     function handleMouseUp(e: MouseEvent) {
-        // End panning
         if (isPanning) {
             isPanning = false;
             return;
@@ -670,32 +224,16 @@
         const rect = canvas.getBoundingClientRect();
         const screenX = e.clientX - rect.left;
         const screenY = e.clientY - rect.top;
-        const world = screenToWorld(screenX, screenY);
+        const world = screenToWorld(screenX, screenY, panX, panY, zoom);
 
         if (isDragging) {
-            // Box selection complete - convert to world coordinates
-            const startWorld = screenToWorld(dragStart.x, dragStart.y);
-            const endWorld = screenToWorld(dragEnd.x, dragEnd.y);
-            const minX = Math.min(startWorld.x, endWorld.x);
-            const maxX = Math.max(startWorld.x, endWorld.x);
-            const minY = Math.min(startWorld.y, endWorld.y);
-            const maxY = Math.max(startWorld.y, endWorld.y);
-
-            const multi = e.metaKey || e.shiftKey; // Note: ctrlKey is used for panning
-            selectDronesInRect(minX, minY, maxX, maxY, multi);
-
+            const multi = e.metaKey || e.shiftKey;
+            handleBoxSelection({ isDragging, dragStart, dragEnd }, panX, panY, zoom, multi);
             isDragging = false;
             render();
         } else if (!$pathMode && !e.ctrlKey) {
-            // Regular click
             const multi = e.metaKey || e.shiftKey;
-            const droneId = getDroneAt(world.x, world.y);
-
-            if (droneId !== undefined) {
-                selectDrone(droneId, multi);
-            } else if (!multi) {
-                clearSelection();
-            }
+            handleClickSelection(world.x, world.y, multi);
         }
     }
 
@@ -706,32 +244,22 @@
         const mouseX = e.clientX - rect.left;
         const mouseY = e.clientY - rect.top;
 
-        // Calculate zoom change
-        const zoomDelta = -e.deltaY * ZOOM_SENSITIVITY;
-        const newZoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, zoom * (1 + zoomDelta)));
-
-        // Zoom toward mouse position
-        const worldX = (mouseX - panX) / zoom;
-        const worldY = (mouseY - panY) / zoom;
-
-        zoom = newZoom;
-
-        // Adjust pan to keep mouse position fixed
-        panX = mouseX - worldX * zoom;
-        panY = mouseY - worldY * zoom;
+        const result = computeWheelZoom(e.deltaY, mouseX, mouseY, zoom, panX, panY);
+        zoom = result.zoom;
+        panX = result.panX;
+        panY = result.panY;
 
         render();
     }
 
     function handleClick(e: MouseEvent) {
-        // Only handle clicks in path mode (box selection handles other clicks via mouseup)
         if (!$pathMode) return;
-        if (e.ctrlKey) return; // Don't add waypoints while panning
+        if (e.ctrlKey) return;
 
         const rect = canvas.getBoundingClientRect();
         const screenX = e.clientX - rect.left;
         const screenY = e.clientY - rect.top;
-        const world = screenToWorld(screenX, screenY);
+        const world = handlePathClick(screenX, screenY, panX, panY, zoom);
 
         currentPath.update((path) => [...path, { x: world.x, y: world.y }]);
     }
@@ -742,7 +270,7 @@
         const rect = canvas.getBoundingClientRect();
         const screenX = e.clientX - rect.left;
         const screenY = e.clientY - rect.top;
-        const world = screenToWorld(screenX, screenY);
+        const world = screenToWorld(screenX, screenY, panX, panY, zoom);
 
         if ($pathMode) {
             if ($currentPath.length > 0) {
@@ -755,7 +283,6 @@
             return;
         }
 
-        // Handle waypoint assignment (use world coordinates)
         if ($coordinationMode === 'swarm') {
             assignWaypointAll(world.x, world.y);
         } else if ($status.selectedCount > 0) {
@@ -763,10 +290,179 @@
         }
     }
 
+    function getTouchDistance(t1: Touch, t2: Touch): number {
+        const dx = t1.clientX - t2.clientX;
+        const dy = t1.clientY - t2.clientY;
+        return Math.sqrt(dx * dx + dy * dy);
+    }
+
+    function handleTouchStart(e: TouchEvent) {
+        e.preventDefault();
+        const rect = canvas.getBoundingClientRect();
+
+        if (e.touches.length === 1) {
+            const touch = e.touches[0];
+            const screenX = touch.clientX - rect.left;
+            const screenY = touch.clientY - rect.top;
+
+            touchStartTime = Date.now();
+            touchStartPos = { x: screenX, y: screenY };
+            isTouchPanning = false;
+            touchPanStart = { x: screenX - panX, y: screenY - panY };
+
+            // Start long-press timer (right-click equivalent)
+            if (longPressTimer) clearTimeout(longPressTimer);
+            longPressTimer = setTimeout(() => {
+                const world = screenToWorld(screenX, screenY, panX, panY, zoom);
+                if ($coordinationMode === 'swarm') {
+                    assignWaypointAll(world.x, world.y);
+                } else if ($status.selectedCount > 0) {
+                    assignWaypoint(world.x, world.y);
+                }
+                longPressTimer = null;
+            }, 500);
+        } else if (e.touches.length === 2) {
+            // Cancel long press and single-finger actions on two-finger gesture
+            if (longPressTimer) {
+                clearTimeout(longPressTimer);
+                longPressTimer = null;
+            }
+            isTouchPanning = false;
+            lastTouchDist = getTouchDistance(e.touches[0], e.touches[1]);
+        }
+    }
+
+    function handleTouchMove(e: TouchEvent) {
+        e.preventDefault();
+        const rect = canvas.getBoundingClientRect();
+
+        if (e.touches.length === 1) {
+            const touch = e.touches[0];
+            const screenX = touch.clientX - rect.left;
+            const screenY = touch.clientY - rect.top;
+
+            const dx = Math.abs(screenX - touchStartPos.x);
+            const dy = Math.abs(screenY - touchStartPos.y);
+
+            if (dx > 10 || dy > 10) {
+                // Movement exceeds threshold - this is a pan, cancel long press
+                if (longPressTimer) {
+                    clearTimeout(longPressTimer);
+                    longPressTimer = null;
+                }
+                isTouchPanning = true;
+            }
+
+            if (isTouchPanning) {
+                panX = screenX - touchPanStart.x;
+                panY = screenY - touchPanStart.y;
+                render();
+            }
+        } else if (e.touches.length === 2) {
+            // Pinch to zoom
+            const newDist = getTouchDistance(e.touches[0], e.touches[1]);
+            if (lastTouchDist > 0) {
+                const scale = newDist / lastTouchDist;
+
+                // Calculate midpoint for zoom center
+                const midX = (e.touches[0].clientX + e.touches[1].clientX) / 2 - rect.left;
+                const midY = (e.touches[0].clientY + e.touches[1].clientY) / 2 - rect.top;
+
+                const worldX = (midX - panX) / zoom;
+                const worldY = (midY - panY) / zoom;
+
+                const newZoom = Math.max(0.1, Math.min(4.0, zoom * scale));
+                panX = midX - worldX * newZoom;
+                panY = midY - worldY * newZoom;
+                zoom = newZoom;
+
+                render();
+            }
+            lastTouchDist = newDist;
+        }
+    }
+
+    function handleTouchEnd(e: TouchEvent) {
+        e.preventDefault();
+
+        if (longPressTimer) {
+            clearTimeout(longPressTimer);
+            longPressTimer = null;
+        }
+
+        // Detect tap: short duration, minimal movement
+        if (e.changedTouches.length === 1 && e.touches.length === 0) {
+            const touch = e.changedTouches[0];
+            const rect = canvas.getBoundingClientRect();
+            const screenX = touch.clientX - rect.left;
+            const screenY = touch.clientY - rect.top;
+
+            const dx = Math.abs(screenX - touchStartPos.x);
+            const dy = Math.abs(screenY - touchStartPos.y);
+            const elapsed = Date.now() - touchStartTime;
+
+            if (dx < 10 && dy < 10 && elapsed < 300) {
+                // Tap - select drone at location
+                const world = screenToWorld(screenX, screenY, panX, panY, zoom);
+                handleClickSelection(world.x, world.y, false);
+            }
+        }
+
+        // Reset pinch state
+        lastTouchDist = 0;
+        isTouchPanning = false;
+    }
+
     function resetView() {
         zoom = 1.0;
         panX = 0;
         panY = 0;
+        render();
+    }
+
+    /** Auto-fit zoom/pan so all targets and drones are visible with padding. */
+    function fitToView() {
+        const points: { x: number; y: number }[] = [];
+
+        for (const t of $targets) {
+            if (!t.destroyed) points.push(t);
+        }
+        for (const d of $renderState) {
+            points.push({ x: d.x, y: d.y });
+        }
+
+        if (points.length === 0) return;
+
+        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+        for (const p of points) {
+            if (p.x < minX) minX = p.x;
+            if (p.y < minY) minY = p.y;
+            if (p.x > maxX) maxX = p.x;
+            if (p.y > maxY) maxY = p.y;
+        }
+
+        // Add 10% padding
+        const padX = Math.max((maxX - minX) * 0.1, 100);
+        const padY = Math.max((maxY - minY) * 0.1, 100);
+        minX -= padX;
+        minY -= padY;
+        maxX += padX;
+        maxY += padY;
+
+        const boxW = maxX - minX;
+        const boxH = maxY - minY;
+
+        if (boxW <= 0 || boxH <= 0) return;
+
+        // Fit to canvas, using the smaller scale so everything fits
+        const scaleX = width / boxW;
+        const scaleY = height / boxH;
+        zoom = Math.min(scaleX, scaleY);
+
+        // Center the bounding box in the canvas
+        panX = (width - boxW * zoom) / 2 - minX * zoom;
+        panY = (height - boxH * zoom) / 2 - minY * zoom;
+
         render();
     }
 </script>
@@ -782,10 +478,16 @@
         onclick={handleClick}
         oncontextmenu={handleRightClick}
         onwheel={handleWheel}
+        ontouchstart={handleTouchStart}
+        ontouchmove={handleTouchMove}
+        ontouchend={handleTouchEnd}
     ></canvas>
-    {#if zoom !== 1.0}
-        <button class="reset-view-btn" onclick={resetView}>Reset View</button>
-    {/if}
+    <div class="view-buttons">
+        <button class="view-btn" onclick={fitToView}>Fit View</button>
+        {#if zoom !== 1.0}
+            <button class="view-btn" onclick={resetView}>Reset View</button>
+        {/if}
+    </div>
 </div>
 
 <style>
@@ -803,10 +505,15 @@
         display: block;
     }
 
-    .reset-view-btn {
+    .view-buttons {
         position: absolute;
         bottom: 10px;
         left: 10px;
+        display: flex;
+        gap: 6px;
+    }
+
+    .view-btn {
         padding: 6px 12px;
         background: rgba(52, 92, 0, 0.8);
         color: #9DFF20;
@@ -818,7 +525,7 @@
         transition: background 0.2s;
     }
 
-    .reset-view-btn:hover {
+    .view-btn:hover {
         background: rgba(157, 255, 32, 0.3);
     }
 </style>
