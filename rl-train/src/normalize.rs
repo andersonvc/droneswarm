@@ -127,6 +127,74 @@ impl RunningMeanStd {
     }
 }
 
+/// Value normalizer for critic targets (PopArt-style).
+///
+/// Tracks running mean and standard deviation of value targets (returns).
+/// Normalizes targets before critic training and denormalizes critic outputs
+/// for GAE computation. This stabilizes critic learning when reward scales
+/// change across curriculum stages or as the policy improves.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ValueNormalizer {
+    pub mean: f32,
+    pub var: f32,
+    pub count: f64,
+}
+
+impl ValueNormalizer {
+    pub fn new() -> Self {
+        ValueNormalizer {
+            mean: 0.0,
+            var: 1.0,
+            count: 0.0,
+        }
+    }
+
+    /// Update running statistics from a batch of return values.
+    pub fn update(&mut self, values: &[f32]) {
+        for &v in values {
+            self.count += 1.0;
+            let delta = v as f64 - self.mean as f64;
+            self.mean += (delta / self.count) as f32;
+            let delta2 = v as f64 - self.mean as f64;
+            self.var = if self.count > 1.0 {
+                (self.var as f64 * (self.count - 1.0) / self.count + delta * delta2 / self.count) as f32
+            } else {
+                1.0
+            };
+        }
+    }
+
+    fn std(&self) -> f32 {
+        (self.var + 1e-8).sqrt()
+    }
+
+    /// Normalize a value: `(v - mean) / std`
+    pub fn normalize(&self, v: f32) -> f32 {
+        (v - self.mean) / self.std()
+    }
+
+    /// Denormalize a value: `v * std + mean`
+    pub fn denormalize(&self, v: f32) -> f32 {
+        v * self.std() + self.mean
+    }
+
+    /// Normalize a batch of values in-place.
+    pub fn normalize_batch(&self, values: &mut [f32]) {
+        let s = self.std();
+        for v in values.iter_mut() {
+            *v = (*v - self.mean) / s;
+        }
+    }
+
+    /// Denormalize a batch of values in-place.
+    pub fn denormalize_batch(&self, values: &mut [f32]) {
+        let s = self.std();
+        for v in values.iter_mut() {
+            *v = *v * s + self.mean;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

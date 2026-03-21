@@ -16,7 +16,7 @@ use rl_train::network::mixer::QMIXMixer;
 use rl_train::network::layer::matmul_bias_relu;
 use rl_train::ppo::Transition;
 use rl_train::ppo::backward::PolicyNetV2PPOExt;
-use rl_train::normalize::RunningMeanStd;
+use rl_train::normalize::{RunningMeanStd, ValueNormalizer};
 use rl_train::checkpoint_pool::CheckpointPool;
 use rl_train::curriculum::Curriculum;
 use rand::{Rng, SeedableRng};
@@ -252,6 +252,8 @@ fn main() {
 
     // Running observation normalizers (Welford's online algorithm).
     let mut ego_normalizer = RunningMeanStd::new(EGO_DIM);
+    // PopArt-style value normalization for stable critic learning.
+    let mut value_normalizer = ValueNormalizer::new();
     // Skip normalizing categorical/binary entity dims: type_flag (6), alive_flag (7), is_current_target (9).
     // Note: entity normalization is disabled (features are pre-normalized in obs_encoding),
     // but we keep the normalizer for checkpoint compatibility and logging.
@@ -437,8 +439,10 @@ fn main() {
                 total_a, critic.fc1.out_dim, critic_in_dim, true);
             let c_h2 = matmul_bias_relu(&c_h1, &critic.fc2.weights, &critic.fc2.biases,
                 total_a, critic.fc2.out_dim, critic.fc2.in_dim, true);
-            let centralized_values = matmul_bias_relu(&c_h2, &critic.value_head.weights, &critic.value_head.biases,
+            let mut centralized_values = matmul_bias_relu(&c_h2, &critic.value_head.weights, &critic.value_head.biases,
                 total_a, 1, critic.value_head.in_dim, false);
+            // Denormalize critic outputs for GAE (critic learns in normalized space).
+            value_normalizer.denormalize_batch(&mut centralized_values);
 
             // --- 3. Step envs in parallel (self-play or doctrine) ---
             let per_env_results: Vec<_> = envs.par_iter_mut()
@@ -630,8 +634,10 @@ fn main() {
                     boot_total, critic.fc1.out_dim, critic_in_dim, true);
                 let bc_h2 = matmul_bias_relu(&bc_h1, &critic.fc2.weights, &critic.fc2.biases,
                     boot_total, critic.fc2.out_dim, critic.fc2.in_dim, true);
-                let boot_centralized_values = matmul_bias_relu(&bc_h2, &critic.value_head.weights, &critic.value_head.biases,
+                let mut boot_centralized_values = matmul_bias_relu(&bc_h2, &critic.value_head.weights, &critic.value_head.biases,
                     boot_total, 1, critic.value_head.in_dim, false);
+                // Denormalize bootstrap values.
+                value_normalizer.denormalize_batch(&mut boot_centralized_values);
 
                 for (i, &(env_idx, drone_id)) in boot_keys.iter().enumerate() {
                     last_values_map.insert((env_idx, drone_id), boot_centralized_values[i]);
@@ -693,6 +699,9 @@ fn main() {
             }
         }
 
+        // Update value normalizer with this rollout's returns.
+        value_normalizer.update(&returns);
+
         // Normalize advantages.
         let n = rollout.len();
         let adv_mean: f32 = advantages.iter().sum::<f32>() / n as f32;
@@ -747,7 +756,9 @@ fn main() {
                 let mut critic_count = 0usize;
                 for k in 0..critic_budget {
                     let i = (k * stride).min(n_total - 1);
-                    let d = MAPPO_VF_COEF * 2.0 * (c_vals[i] - team_returns[i]);
+                    // Normalize target to match critic's output space.
+                    let normalized_target = value_normalizer.normalize(team_returns[i]);
+                    let d = MAPPO_VF_COEF * 2.0 * (c_vals[i] - normalized_target);
                     let pool_idx = rollout_step_indices[i] * config.n_envs + rollout_env_indices[i];
                     critic.forward(&cached_h2_flat[i * hidden..(i + 1) * hidden], &step_mean_pools[pool_idx]);
                     critic.backward(d);
