@@ -17,6 +17,7 @@
         explosions,
         targets,
         targetCounts,
+        droneCounts,
         gameResult,
     } from '$lib/stores/simulation';
 
@@ -33,7 +34,7 @@
     import { DRAG_THRESHOLD, handleBoxSelection, handleClickSelection } from './input/selection';
     import { handlePathClick } from './input/path-placement';
 
-    let { width = 1000, height = 1000, worldWidth = 4000, worldHeight = 4000 } = $props();
+    let { width = 1000, height = 1000, worldWidth = 4000, worldHeight = 4000, hideViewControls = false } = $props();
 
     let canvas: HTMLCanvasElement;
     let ctx: CanvasRenderingContext2D | null = $state(null);
@@ -152,10 +153,10 @@
         }
 
         if (zoom !== 1.0) {
-            drawZoomIndicator(ctx, zoom, width, height);
+            if (!hideViewControls) drawZoomIndicator(ctx, zoom, width, height);
         }
 
-        drawTargetScore(ctx, $targetCounts);
+        drawTargetScore(ctx, $targetCounts, $droneCounts);
 
         if ($gameResult) {
             drawWinBanner(ctx, $gameResult, width, height);
@@ -482,12 +483,14 @@
         ontouchmove={handleTouchMove}
         ontouchend={handleTouchEnd}
     ></canvas>
-    <div class="view-buttons">
-        <button class="view-btn" onclick={fitToView}>Fit View</button>
-        {#if zoom !== 1.0}
-            <button class="view-btn" onclick={resetView}>Reset View</button>
-        {/if}
-    </div>
+    {#if !hideViewControls}
+        <div class="view-buttons">
+            <button class="view-btn" onclick={fitToView}>Fit View</button>
+            {#if zoom !== 1.0}
+                <button class="view-btn" onclick={resetView}>Reset View</button>
+            {/if}
+        </div>
+    {/if}
 </div>
 
 <style>

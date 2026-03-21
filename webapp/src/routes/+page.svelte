@@ -1,5 +1,6 @@
 <script lang="ts">
     import { onMount, onDestroy } from 'svelte';
+    import { page } from '$app/stores';
     import {
         isInitialized,
         isRunning,
@@ -27,6 +28,9 @@
     import ConfigSidePanel from '$lib/components/ConfigSidePanel.svelte';
     import StrategySelector from '$lib/components/StrategySelector.svelte';
 
+    // Demo mode: ?demo in URL hides controls, shows only canvas + score + strategies
+    let demoMode = $derived($page.url.searchParams.has('demo'));
+
     let animationFrame: number;
     let lastTime = 0;
     let tooltipX = $state(0);
@@ -42,9 +46,9 @@
         if (typeof window === 'undefined') return;
 
         isMobile = window.innerWidth < 768;
-        const sidebarWidth = 220;
-        canvasWidth = isMobile ? window.innerWidth : window.innerWidth - sidebarWidth;
-        canvasHeight = isMobile ? window.innerHeight : window.innerHeight;
+        const sidebarWidth = (demoMode || isMobile) ? 0 : 220;
+        canvasWidth = window.innerWidth - sidebarWidth;
+        canvasHeight = window.innerHeight;
     }
 
     let unsubGameResult: (() => void) | null = null;
@@ -157,7 +161,16 @@
 
 <main onmousemove={handleMouseMove}>
     {#if $isInitialized}
-        {#if isMobile}
+        {#if demoMode}
+            <div class="simulation-container">
+                <SimulationCanvas width={canvasWidth} height={canvasHeight} worldWidth={4000} worldHeight={4000} hideViewControls={true} />
+            </div>
+            <div class="demo-overlay">
+                <div class="demo-strategies">
+                    <StrategySelector />
+                </div>
+            </div>
+        {:else if isMobile}
             <div class="simulation-container">
                 <SimulationCanvas width={canvasWidth} height={canvasHeight} worldWidth={4000} worldHeight={4000} />
             </div>
@@ -333,6 +346,23 @@
         margin-top: 12px;
         padding-top: 12px;
         border-top: 1px solid #1f1f25;
+    }
+
+    .demo-overlay {
+        position: fixed;
+        top: 0;
+        right: 0;
+        pointer-events: none;
+        z-index: 10;
+        padding: 16px;
+    }
+
+    .demo-strategies {
+        pointer-events: auto;
+        background: rgba(10, 10, 15, 0.8);
+        border: 1px solid #1f1f25;
+        border-radius: 8px;
+        padding: 12px 16px;
     }
 
     .mobile-menu-btn {

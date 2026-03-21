@@ -70,6 +70,10 @@ export function getGroupSplitId(): number {
 export const isInitialized = writable(false);
 export const isRunning = writable(false);
 export const renderState = writable<DroneRenderData[]>([]);
+export const droneCounts = derived(renderState, ($rs) => ({
+    a: $rs.filter(d => d.id < groupSplitId).length,
+    b: $rs.filter(d => d.id >= groupSplitId).length,
+}));
 export const status = writable<SwarmStatus>({
     simulationTime: 0,
     droneCount: 0,
