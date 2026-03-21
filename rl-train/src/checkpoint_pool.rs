@@ -36,7 +36,7 @@ impl CheckpointPool {
         if self.checkpoints.is_empty() {
             return None;
         }
-        let idx = (rng_seed % self.checkpoints.len() as u64) as usize;
+        let idx = ((rng_seed.wrapping_mul(2654435769) >> 16) % self.checkpoints.len() as u64) as usize;
         Some(&self.checkpoints[idx])
     }
 

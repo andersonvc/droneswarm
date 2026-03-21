@@ -8,6 +8,10 @@ pub struct RunningMeanStd {
     pub var: Vec<f32>,
     pub count: f64,
     dim: usize,
+    /// Indices to skip during normalization (pass through unchanged).
+    /// Used for categorical features like type_flag and alive_flag.
+    #[serde(default)]
+    pub skip_indices: Vec<usize>,
 }
 
 impl RunningMeanStd {
@@ -18,6 +22,19 @@ impl RunningMeanStd {
             var: vec![1.0; dim],
             count: 0.0,
             dim,
+            skip_indices: Vec::new(),
+        }
+    }
+
+    /// Initialize with skip indices for categorical dimensions.
+    /// Skipped dimensions are passed through unchanged during normalization.
+    pub fn new_with_skip(dim: usize, skip_indices: Vec<usize>) -> Self {
+        Self {
+            mean: vec![0.0; dim],
+            var: vec![1.0; dim],
+            count: 0.0,
+            dim,
+            skip_indices,
         }
     }
 
@@ -69,16 +86,25 @@ impl RunningMeanStd {
     }
 
     /// Normalize a single observation: `(x - mean) / sqrt(var + 1e-8)`, clipped to [-10, 10].
+    /// Skipped indices are passed through unchanged.
     pub fn normalize(&self, input: &[f32]) -> Vec<f32> {
         debug_assert_eq!(input.len(), self.dim);
         input
             .iter()
+            .enumerate()
             .zip(self.mean.iter().zip(self.var.iter()))
-            .map(|(&x, (&m, &v))| ((x - m) / (v + 1e-8).sqrt()).clamp(-10.0, 10.0))
+            .map(|((d, &x), (&m, &v))| {
+                if self.skip_indices.contains(&d) {
+                    x
+                } else {
+                    ((x - m) / (v + 1e-8).sqrt()).clamp(-10.0, 10.0)
+                }
+            })
             .collect()
     }
 
     /// Normalize a batch of observations. Returns a new vec of the same layout.
+    /// Skipped indices are passed through unchanged.
     ///
     /// `batch` is `[batch_size, dim]` row-major.
     pub fn normalize_batch(&self, batch: &[f32], batch_size: usize) -> Vec<f32> {
@@ -88,9 +114,13 @@ impl RunningMeanStd {
             let offset = row * self.dim;
             for d in 0..self.dim {
                 let x = batch[offset + d];
-                let normed =
-                    ((x - self.mean[d]) / (self.var[d] + 1e-8).sqrt()).clamp(-10.0, 10.0);
-                out.push(normed);
+                if self.skip_indices.contains(&d) {
+                    out.push(x);
+                } else {
+                    let normed =
+                        ((x - self.mean[d]) / (self.var[d] + 1e-8).sqrt()).clamp(-10.0, 10.0);
+                    out.push(normed);
+                }
             }
         }
         out
@@ -181,5 +211,33 @@ mod tests {
         assert_eq!(batch_out[1], single_0[1]);
         assert_eq!(batch_out[2], single_1[0]);
         assert_eq!(batch_out[3], single_1[1]);
+    }
+
+    #[test]
+    fn test_skip_indices_passthrough() {
+        // dim=4, skip indices 2 and 3 (categorical).
+        let mut rms = RunningMeanStd::new_with_skip(4, vec![2, 3]);
+        rms.update_batch(&[10.0, 20.0, 1.0, 0.0, 30.0, 40.0, 2.0, 1.0], 2);
+
+        let input = [15.0, 25.0, 3.0, 1.0];
+        let normed = rms.normalize(&input);
+        // Dims 2 and 3 should pass through unchanged.
+        assert_eq!(normed[2], 3.0, "skip dim 2 should be unchanged");
+        assert_eq!(normed[3], 1.0, "skip dim 3 should be unchanged");
+        // Dims 0 and 1 should be normalized (not equal to input).
+        assert_ne!(normed[0], 15.0, "dim 0 should be normalized");
+        assert_ne!(normed[1], 25.0, "dim 1 should be normalized");
+    }
+
+    #[test]
+    fn test_skip_indices_batch_passthrough() {
+        let mut rms = RunningMeanStd::new_with_skip(3, vec![1]);
+        rms.update_batch(&[1.0, 0.0, 2.0, 3.0, 1.0, 4.0], 2);
+
+        let batch = [5.0, 2.0, 6.0, 7.0, 3.0, 8.0];
+        let normed = rms.normalize_batch(&batch, 2);
+        // Dim 1 (index 1) should pass through for both rows.
+        assert_eq!(normed[1], 2.0, "row 0 skip dim should be unchanged");
+        assert_eq!(normed[4], 3.0, "row 1 skip dim should be unchanged");
     }
 }

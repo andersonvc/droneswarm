@@ -14,11 +14,11 @@ use rl_train::network::policy_v2::PolicyNetV2;
 use rl_train::network::critic::CentralizedCritic;
 use rl_train::network::mixer::QMIXMixer;
 use rl_train::network::layer::matmul_bias_relu;
-use rl_train::ppo::{compute_gae, Transition};
+use rl_train::ppo::Transition;
 use rl_train::ppo::backward::PolicyNetV2PPOExt;
 use rl_train::normalize::RunningMeanStd;
 use rl_train::checkpoint_pool::CheckpointPool;
-use rl_train::curriculum::curriculum_config_smooth;
+use rl_train::curriculum::Curriculum;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use rayon::prelude::*;
@@ -46,7 +46,8 @@ struct TrainConfig {
     clip_range: f32,
     ent_coef_start: f32,
     ent_coef_end: f32,
-    vf_coef: f32,
+    #[allow(dead_code)]
+    vf_coef: f32, // Unused: local_value_head disabled; centralized critic handles value prediction
     max_grad_norm: f32,
     n_envs: usize,
     hidden_size: usize,
@@ -57,96 +58,113 @@ struct TrainConfig {
     eval_episodes: usize,
     opponent_update_freq: usize,
     output_dir: String,
+    resume: Option<String>,
 }
 
 impl Default for TrainConfig {
     fn default() -> Self {
         TrainConfig {
             total_timesteps: 50_000_000,
-            n_steps: 512,
+            n_steps: 256,
             n_epochs: 4,
-            batch_size: 4096,
-            lr: 1e-4,
+            batch_size: 8192,
+            lr: 5e-4,
             gamma: 0.99,
-            lam: 0.95,
+            lam: 0.97,
             clip_range: 0.2,
-            ent_coef_start: 0.02,
-            ent_coef_end: 0.001,
+            ent_coef_start: 0.03,
+            ent_coef_end: 0.005,
             vf_coef: 0.5,
             max_grad_norm: 0.5,
             n_envs: 1024,
             hidden_size: 256,
             drones_per_side: 24,
             targets_per_side: 6,
-            max_ticks: 6000,
-            eval_freq: 50,
+            max_ticks: 10000,
+            eval_freq: 10,
             eval_episodes: 50,
             opponent_update_freq: 30,
             output_dir: "results".to_string(),
+            resume: None,
         }
     }
 }
 
-fn make_sim_config(tc: &TrainConfig) -> SimConfig {
+fn make_sim_config(tc: &TrainConfig, world_size: f32) -> SimConfig {
+    // Dynamically set max_ticks so a drone can traverse the diagonal 1x.
+    // Gives ~177 decision steps at stage 0 — enough for 4v4 combat.
+    let speed_multiplier = 2.0f32;
+    let distance_per_tick = 20.0 * 0.05 * speed_multiplier; // 2.0 m/tick
+    let diagonal = world_size * std::f32::consts::SQRT_2;
+    let dynamic_max_ticks = (diagonal / distance_per_tick).ceil() as u32;
+    // Use the larger of the user-specified max_ticks and the dynamic value.
+    let max_ticks = tc.max_ticks.max(dynamic_max_ticks);
+
     SimConfig {
         drones_per_side: tc.drones_per_side,
         targets_per_side: tc.targets_per_side,
-        max_ticks: tc.max_ticks,
+        world_size,
+        max_ticks,
+        speed_multiplier,
         seed: 0,
         randomize_opponent: false,
         ..Default::default()
     }
 }
 
-/// Normalize a DroneObsV2 in-place using running normalizers.
-fn normalize_obs(obs: &DroneObsV2, ego_norm: &RunningMeanStd, ent_norm: &RunningMeanStd) -> DroneObsV2 {
+/// Normalize a DroneObsV2 using the ego running normalizer.
+///
+/// Entity features are already normalized in obs_encoding (dx/w, dy/w, dist/diag,
+/// vx/max_v, vy/max_v, heading/pi) so they pass through unchanged.
+fn normalize_obs(obs: &DroneObsV2, ego_norm: &RunningMeanStd, _ent_norm: &RunningMeanStd) -> DroneObsV2 {
     let ego = ego_norm.normalize(&obs.ego);
-    let mut entities = Vec::with_capacity(obs.entities.len());
-    for i in 0..obs.n_entities {
-        let start = i * ENTITY_DIM;
-        let end = start + ENTITY_DIM;
-        entities.extend_from_slice(&ent_norm.normalize(&obs.entities[start..end]));
-    }
-    DroneObsV2 { ego, entities, n_entities: obs.n_entities }
+    DroneObsV2 { ego, entities: obs.entities.clone(), n_entities: obs.n_entities }
 }
 
-/// Run self-play evaluation.
-fn evaluate(policy: &PolicyNetV2, ego_norm: &RunningMeanStd, ent_norm: &RunningMeanStd, config: &TrainConfig, base_seed: u64) -> (f32, f32, f32) {
+/// Evaluate RL policy vs doctrine opponents (not self-play).
+/// Runs half episodes against aggressive doctrine, half against defensive.
+/// This measures absolute strength rather than relative self-play win rate.
+fn evaluate(
+    policy: &PolicyNetV2,
+    ego_norm: &RunningMeanStd,
+    ent_norm: &RunningMeanStd,
+    config: &TrainConfig,
+    stage: &rl_train::curriculum::CurriculumStage,
+    base_seed: u64,
+) -> (f32, f32, f32) {
     let results: Vec<(u32, f32, u64)> = (0..config.eval_episodes)
         .into_par_iter()
         .map(|ep| {
             let mut rng = ChaCha8Rng::seed_from_u64(base_seed + ep as u64);
-            let sim_config = make_sim_config(config);
-            let mut env = SimRunner::new(sim_config);
-            let ((mut obs_a, mut ids_a), (mut obs_b, mut ids_b)) =
+            let mut sc = make_sim_config(config, stage.world_size);
+            sc.drones_per_side = stage.drones_per_side;
+            sc.targets_per_side = stage.targets_per_side;
+            // Alternate aggressive/defensive doctrine opponents.
+            sc.randomize_opponent = true;
+            let mut env = SimRunner::new(sc);
+
+            // Reset for RL (group A) vs doctrine (group B).
+            let ((mut obs_a, mut ids_a), (_obs_b, _ids_b)) =
                 env.reset_selfplay_with_seed(10000 + ep as u64);
             let mut ep_reward = 0.0f32;
             let mut ep_len = 0u64;
             let mut win = 0u32;
 
             loop {
-                // Normalize and build batched inputs.
                 let norm_a: Vec<DroneObsV2> = obs_a.iter().map(|o| normalize_obs(o, ego_norm, ent_norm)).collect();
                 let egos_a: Vec<&[f32]> = norm_a.iter().map(|o| o.ego.as_slice()).collect();
                 let ents_a: Vec<&[f32]> = norm_a.iter().map(|o| o.entities.as_slice()).collect();
                 let nents_a: Vec<usize> = norm_a.iter().map(|o| o.n_entities).collect();
-                let results_a = policy.act_batch(&egos_a, &ents_a, &nents_a, &mut rng);
+                // Use raw entities for action masking (consistent with training).
+                let raw_ents_a: Vec<&[f32]> = obs_a.iter().map(|o| o.entities.as_slice()).collect();
+                let (results_a, _) = policy.act_batch_with_h2_masked(&egos_a, &ents_a, &nents_a, Some(&raw_ents_a), &mut rng);
                 let actions_a: Vec<(usize, u32)> = ids_a.iter()
                     .zip(results_a.iter())
                     .map(|(&id, &(act, _, _))| (id, act))
                     .collect();
 
-                let norm_b: Vec<DroneObsV2> = obs_b.iter().map(|o| normalize_obs(o, ego_norm, ent_norm)).collect();
-                let egos_b: Vec<&[f32]> = norm_b.iter().map(|o| o.ego.as_slice()).collect();
-                let ents_b: Vec<&[f32]> = norm_b.iter().map(|o| o.entities.as_slice()).collect();
-                let nents_b: Vec<usize> = norm_b.iter().map(|o| o.n_entities).collect();
-                let results_b = policy.act_batch(&egos_b, &ents_b, &nents_b, &mut rng);
-                let actions_b: Vec<(usize, u32)> = ids_b.iter()
-                    .zip(results_b.iter())
-                    .map(|(&id, &(act, _, _))| (id, act))
-                    .collect();
-
-                let result = env.step_multi_selfplay(&actions_a, &actions_b);
+                // Step with doctrine opponent (Group B handled by engine).
+                let result = env.step_rl_vs_doctrine_v2(&actions_a);
                 ep_reward += result.reward;
                 ep_len += 1;
 
@@ -155,8 +173,6 @@ fn evaluate(policy: &PolicyNetV2, ego_norm: &RunningMeanStd, ent_norm: &RunningM
 
                 obs_a = result.obs_a;
                 ids_a = result.drone_ids_a;
-                obs_b = result.obs_b;
-                ids_b = result.drone_ids_b;
             }
             (win, ep_reward, ep_len)
         })
@@ -169,12 +185,22 @@ fn evaluate(policy: &PolicyNetV2, ego_norm: &RunningMeanStd, ent_norm: &RunningM
     (wins as f32 / n, total_reward as f32 / n, total_length as f32 / n)
 }
 
+/// Opponent type for each environment.
+#[derive(Clone, Copy, PartialEq)]
+enum OpponentType {
+    /// Both groups RL-controlled (self-play).
+    SelfPlay,
+    /// Group B uses built-in doctrine (aggressive or defensive, randomized on reset).
+    Doctrine,
+}
+
 /// Per-env state for self-play rollout collection.
 struct EnvState {
     obs_a: Vec<DroneObsV2>,
     drone_ids_a: Vec<usize>,
     obs_b: Vec<DroneObsV2>,
     drone_ids_b: Vec<usize>,
+    opponent_type: OpponentType,
 }
 
 /// Per-env action mapping into the flat batch.
@@ -183,6 +209,16 @@ struct EnvActionSlice {
     a_count: usize,
     b_start: usize,
     b_count: usize,
+}
+
+/// Fraction of envs that use doctrine opponents (rest use self-play).
+/// Pure doctrine in early stages; introduces self-play after agent can beat doctrine.
+fn doctrine_fraction(curriculum_stage: usize) -> f32 {
+    if curriculum_stage <= 1 {
+        1.0  // Pure doctrine until agent beats it
+    } else {
+        0.5  // Mix doctrine + self-play in later stages
+    }
 }
 
 fn main() {
@@ -201,7 +237,12 @@ fn main() {
     let mut rng = ChaCha8Rng::seed_from_u64(42);
 
     // PolicyNetV2: entity-attention architecture.
-    let mut policy = PolicyNetV2::new(EGO_DIM, ENTITY_DIM, ACT_DIM, EMBED_DIM, config.hidden_size, &mut rng);
+    let mut policy = if let Some(ref path) = config.resume {
+        println!("Resuming from: {}", path);
+        PolicyNetV2::load(path).expect("Failed to load resume model")
+    } else {
+        PolicyNetV2::new(EGO_DIM, ENTITY_DIM, ACT_DIM, EMBED_DIM, config.hidden_size, &mut rng)
+    };
     let mut opponent = policy.clone();
 
     // MAPPO centralized critic + QMIX mixer.
@@ -211,38 +252,48 @@ fn main() {
 
     // Running observation normalizers (Welford's online algorithm).
     let mut ego_normalizer = RunningMeanStd::new(EGO_DIM);
-    let mut entity_normalizer = RunningMeanStd::new(ENTITY_DIM);
+    // Skip normalizing categorical/binary entity dims: type_flag (6), alive_flag (7), is_current_target (9).
+    // Note: entity normalization is disabled (features are pre-normalized in obs_encoding),
+    // but we keep the normalizer for checkpoint compatibility and logging.
+    let entity_normalizer = RunningMeanStd::new_with_skip(ENTITY_DIM, vec![6, 7, 9]);
 
     // Checkpoint pool for diverse self-play opponents.
     let mut checkpoint_pool = CheckpointPool::new(CHECKPOINT_POOL_SIZE);
 
-    // Curriculum init (smooth blending).
-    let (init_drones, init_targets) = curriculum_config_smooth(0.0, 0, config.drones_per_side, config.targets_per_side);
+    // Win-rate-based curriculum.
+    let mut curriculum = Curriculum::new(config.drones_per_side, config.targets_per_side);
+    let init_stage = curriculum.current().clone();
 
     let mut envs: Vec<SimRunner> = (0..config.n_envs)
         .map(|i| {
-            let mut sc = make_sim_config(&config);
-            sc.drones_per_side = init_drones;
-            sc.targets_per_side = init_targets;
+            let mut sc = make_sim_config(&config, init_stage.world_size);
+            sc.drones_per_side = init_stage.drones_per_side;
+            sc.targets_per_side = init_stage.targets_per_side;
             sc.seed = i as u64;
             SimRunner::new(sc)
         })
         .collect();
 
-    let mut env_states: Vec<EnvState> = envs.iter().map(|e| {
+    let mut env_states: Vec<EnvState> = envs.iter().enumerate().map(|(i, e)| {
         let (obs_a, drone_ids_a) = e.observe_multi_group_v2(0);
         let (obs_b, drone_ids_b) = e.observe_multi_group_v2(1);
-        EnvState { obs_a, drone_ids_a, obs_b, drone_ids_b }
+        let doc_frac = doctrine_fraction(curriculum.current_stage);
+        let opponent_type = if (i as f32 / config.n_envs as f32) < doc_frac {
+            OpponentType::Doctrine
+        } else {
+            OpponentType::SelfPlay
+        };
+        EnvState { obs_a, drone_ids_a, obs_b, drone_ids_b, opponent_type }
     }).collect();
 
     let mut total_steps = 0u64;
     let mut update_count = 0u64;
     let mut adam_step_count = 0usize;
+    let mut critic_step_count = 0usize;
+    let mut mixer_step_count = 0usize;
     let mut best_win_rate = 0.0f32;
     let mut ep_rewards: Vec<f32> = Vec::new();
     let mut ep_reward_accum = vec![0.0f32; config.n_envs];
-    let mut curr_drones = init_drones;
-    let mut curr_targets = init_targets;
 
     let start_time = Instant::now();
     let n_threads = rayon::current_num_threads();
@@ -256,55 +307,35 @@ fn main() {
     println!("  LR: {} (annealed), Gamma: {}, Clip: {}", config.lr, config.gamma, config.clip_range);
     println!("  Entropy coef: {} → {}", config.ent_coef_start, config.ent_coef_end);
     println!("  Checkpoint pool size: {}, Opponent update freq: {}", CHECKPOINT_POOL_SIZE, config.opponent_update_freq);
-    println!("  Smooth curriculum: 4v4 → {}v{}", config.drones_per_side, config.drones_per_side);
+    println!("  Win-rate curriculum: 4v4 → {}v{} (advance at >{:.0}% win rate, {} consecutive evals)",
+        config.drones_per_side, config.drones_per_side,
+        curriculum.advance_threshold * 100.0, curriculum.required_consecutive);
     println!("  CPUs: {}, Rayon: {}, Accelerate: {}", num_cpus, n_threads, cfg!(target_os = "macos"));
     println!();
 
-    while total_steps < config.total_timesteps {
-        // Smooth curriculum: per-env stage with blended transitions.
-        let progress = (total_steps as f32 / config.total_timesteps as f32).min(1.0);
-
-        // Check if any env needs a curriculum update (sample env 0 as proxy).
-        let (new_drones, new_targets) = curriculum_config_smooth(
-            progress, 0, config.drones_per_side, config.targets_per_side,
-        );
-        if new_drones != curr_drones || new_targets != curr_targets {
-            println!("  Curriculum: {}v{} → {}v{} at {:.1}%",
-                curr_drones, curr_drones, new_drones, new_drones, progress * 100.0);
-            curr_drones = new_drones;
-            curr_targets = new_targets;
-            // Recreate envs with per-env smooth curriculum.
-            for i in 0..config.n_envs {
-                let (d, t) = curriculum_config_smooth(
-                    progress, i as u64, config.drones_per_side, config.targets_per_side,
-                );
-                let mut sc = make_sim_config(&config);
-                sc.drones_per_side = d;
-                sc.targets_per_side = t;
-                sc.seed = total_steps + i as u64;
-                envs[i] = SimRunner::new(sc);
-                let (obs_a, drone_ids_a) = envs[i].observe_multi_group_v2(0);
-                let (obs_b, drone_ids_b) = envs[i].observe_multi_group_v2(1);
-                env_states[i] = EnvState { obs_a, drone_ids_a, obs_b, drone_ids_b };
-                ep_reward_accum[i] = 0.0;
-            }
-        }
+    while config.total_timesteps == 0 || total_steps < config.total_timesteps {
+        curriculum.tick_update();
 
         // ================================================================
         // Collect rollout
         // ================================================================
-        let est_transitions = config.n_steps * config.n_envs * curr_drones as usize;
+        let curr_stage = curriculum.current().clone();
+        let est_transitions = config.n_steps * config.n_envs * curr_stage.drones_per_side as usize;
         let mut rollout: Vec<Transition> = Vec::with_capacity(est_transitions);
         let mut rollout_env_indices: Vec<usize> = Vec::with_capacity(est_transitions);
 
-        // Buffers for raw obs (for normalizer update).
+        // Buffer for ego normalizer update.
         let mut raw_ego_batch: Vec<f32> = Vec::with_capacity(est_transitions * EGO_DIM);
-        let mut raw_ent_batch: Vec<f32> = Vec::new();
-        let mut raw_ent_count: usize = 0;
 
-        // Cached h2 and local_value per transition (avoids re-forwarding in critic/mixer).
-        let mut cached_h2: Vec<Vec<f32>> = Vec::with_capacity(est_transitions);
+        // Cached h2 (flat) and local_value per transition (avoids re-forwarding in critic/mixer).
+        let mut cached_h2_flat: Vec<f32> = Vec::with_capacity(est_transitions * config.hidden_size);
         let mut cached_local_values: Vec<f32> = Vec::with_capacity(est_transitions);
+        // Per-(env, step) mean_pool cached at rollout time (for correct critic input).
+        // Indexed by (step * n_envs + env_idx) to avoid per-transition duplication.
+        let mut step_mean_pools: Vec<Vec<f32>> = Vec::new();
+        let mut rollout_step_indices: Vec<usize> = Vec::with_capacity(est_transitions);
+        // Team-only rewards for critic training (separate from mixed rewards used for PPO).
+        let mut cached_team_rewards: Vec<f32> = Vec::with_capacity(est_transitions);
 
         // Buffers for batched inference.
         let mut ego_refs_a: Vec<Vec<f32>> = Vec::new();
@@ -319,56 +350,33 @@ fn main() {
 
         for _step in 0..config.n_steps {
             // --- 1. Normalize obs in parallel, then flatten ---
-            // Collect all raw obs for normalizer (sequential but fast — just memcpy).
+            // Collect raw ego obs for normalizer update.
             for env_st in &env_states {
                 for obs in &env_st.obs_a {
                     raw_ego_batch.extend_from_slice(&obs.ego);
-                    for i in 0..obs.n_entities {
-                        raw_ent_batch.extend_from_slice(&obs.entities[i * ENTITY_DIM..(i + 1) * ENTITY_DIM]);
-                        raw_ent_count += 1;
-                    }
                 }
             }
 
-            // Normalize all group A obs in parallel.
-            let all_obs_a: Vec<&DroneObsV2> = env_states.iter()
-                .flat_map(|es| es.obs_a.iter())
-                .collect();
-            let norm_a: Vec<DroneObsV2> = all_obs_a.par_iter()
-                .map(|obs| normalize_obs(obs, &ego_normalizer, &entity_normalizer))
-                .collect();
-
-            // Normalize all group B obs in parallel.
-            let all_obs_b: Vec<&DroneObsV2> = env_states.iter()
-                .flat_map(|es| es.obs_b.iter())
-                .collect();
-            let norm_b: Vec<DroneObsV2> = all_obs_b.par_iter()
-                .map(|obs| normalize_obs(obs, &ego_normalizer, &entity_normalizer))
-                .collect();
-
-            // Build flat buffers and slices from normalized obs.
+            // Build flat buffers directly from env_states.
+            // Only ego features need normalization; entities are pre-normalized in obs_encoding.
             ego_refs_a.clear(); ent_refs_a.clear(); nent_a.clear();
             ego_refs_b.clear(); ent_refs_b.clear(); nent_b.clear();
             env_slices.clear(); flat_ids_a.clear(); flat_ids_b.clear();
 
-            let mut a_idx = 0usize;
-            let mut b_idx = 0usize;
             for env_st in &env_states {
                 let a_start = ego_refs_a.len();
-                for _ in 0..env_st.obs_a.len() {
-                    ego_refs_a.push(norm_a[a_idx].ego.clone());
-                    ent_refs_a.push(norm_a[a_idx].entities.clone());
-                    nent_a.push(norm_a[a_idx].n_entities);
-                    a_idx += 1;
+                for obs in &env_st.obs_a {
+                    ego_refs_a.push(ego_normalizer.normalize(&obs.ego));
+                    ent_refs_a.push(obs.entities.clone());
+                    nent_a.push(obs.n_entities);
                 }
                 flat_ids_a.extend_from_slice(&env_st.drone_ids_a);
 
                 let b_start = ego_refs_b.len();
-                for _ in 0..env_st.obs_b.len() {
-                    ego_refs_b.push(norm_b[b_idx].ego.clone());
-                    ent_refs_b.push(norm_b[b_idx].entities.clone());
-                    nent_b.push(norm_b[b_idx].n_entities);
-                    b_idx += 1;
+                for obs in &env_st.obs_b {
+                    ego_refs_b.push(ego_normalizer.normalize(&obs.ego));
+                    ent_refs_b.push(obs.entities.clone());
+                    nent_b.push(obs.n_entities);
                 }
                 flat_ids_b.extend_from_slice(&env_st.drone_ids_b);
 
@@ -383,11 +391,12 @@ fn main() {
             // --- 2. Batched forward pass (with h2 for MAPPO/QMIX) ---
             let egos_a_sl: Vec<&[f32]> = ego_refs_a.iter().map(|e| e.as_slice()).collect();
             let ents_a_sl: Vec<&[f32]> = ent_refs_a.iter().map(|e| e.as_slice()).collect();
-            let (batch_a, h2_flat_a) = policy.act_batch_with_h2(&egos_a_sl, &ents_a_sl, &nent_a, &mut rng);
+            // Entity features are pre-normalized — same data used for both network input and action masking.
+            let (batch_a, h2_flat_a) = policy.act_batch_with_h2_masked(&egos_a_sl, &ents_a_sl, &nent_a, Some(&ents_a_sl), &mut rng);
 
             let egos_b_sl: Vec<&[f32]> = ego_refs_b.iter().map(|e| e.as_slice()).collect();
             let ents_b_sl: Vec<&[f32]> = ent_refs_b.iter().map(|e| e.as_slice()).collect();
-            let batch_b = opponent.act_batch(&egos_b_sl, &ents_b_sl, &nent_b, &mut rng);
+            let (batch_b, _) = opponent.act_batch_with_h2_masked(&egos_b_sl, &ents_b_sl, &nent_b, Some(&ents_b_sl), &mut rng);
 
             // Compute centralized values via batched critic forward.
             // Build flat input: concat(h2_i, mean_pool_env) for each drone.
@@ -409,6 +418,9 @@ fn main() {
                 pool
             }).collect();
 
+            // Cache per-(env, step) mean_pools for critic update.
+            step_mean_pools.extend(mean_pools.iter().cloned());
+
             for (env_idx, slice) in env_slices.iter().enumerate() {
                 for i in 0..slice.a_count {
                     let idx = slice.a_start + i;
@@ -425,21 +437,28 @@ fn main() {
                 total_a, critic.fc1.out_dim, critic_in_dim, true);
             let c_h2 = matmul_bias_relu(&c_h1, &critic.fc2.weights, &critic.fc2.biases,
                 total_a, critic.fc2.out_dim, critic.fc2.in_dim, true);
-            let centralized_values_flat = matmul_bias_relu(&c_h2, &critic.value_head.weights, &critic.value_head.biases,
+            let centralized_values = matmul_bias_relu(&c_h2, &critic.value_head.weights, &critic.value_head.biases,
                 total_a, 1, critic.value_head.in_dim, false);
-            let centralized_values = centralized_values_flat;
 
-            // --- 3. Step envs in parallel ---
+            // --- 3. Step envs in parallel (self-play or doctrine) ---
             let per_env_results: Vec<_> = envs.par_iter_mut()
                 .zip(env_slices.par_iter())
-                .map(|(env, slice)| {
+                .zip(env_states.par_iter())
+                .map(|((env, slice), state)| {
                     let actions_a: Vec<(usize, u32)> = (0..slice.a_count)
                         .map(|i| (flat_ids_a[slice.a_start + i], batch_a[slice.a_start + i].0))
                         .collect();
-                    let actions_b: Vec<(usize, u32)> = (0..slice.b_count)
-                        .map(|i| (flat_ids_b[slice.b_start + i], batch_b[slice.b_start + i].0))
-                        .collect();
-                    env.step_multi_selfplay(&actions_a, &actions_b)
+                    match state.opponent_type {
+                        OpponentType::Doctrine => {
+                            env.step_rl_vs_doctrine_v2(&actions_a)
+                        }
+                        OpponentType::SelfPlay => {
+                            let actions_b: Vec<(usize, u32)> = (0..slice.b_count)
+                                .map(|i| (flat_ids_b[slice.b_start + i], batch_b[slice.b_start + i].0))
+                                .collect();
+                            env.step_multi_selfplay(&actions_a, &actions_b)
+                        }
+                    }
                 })
                 .collect();
 
@@ -448,7 +467,11 @@ fn main() {
                 let result = &per_env_results[env_idx];
                 let slice = &env_slices[env_idx];
                 ep_reward_accum[env_idx] += result.reward;
-                let done = result.terminated || result.truncated;
+                let terminated = result.terminated;
+                let truncated = result.truncated;
+                // Standard MAPPO: each agent receives the full team reward.
+                // The centralized critic handles credit assignment.
+                let per_drone_team_reward = result.reward;
 
                 for i in 0..slice.a_count {
                     let batch_idx = slice.a_start + i;
@@ -456,133 +479,217 @@ fn main() {
                     let drone_id = flat_ids_a[batch_idx];
                     let individual_reward = result.individual_rewards_a.get(&drone_id).copied().unwrap_or(0.0);
                     let drone_died = result.drone_deaths_a.contains(&drone_id);
-                    // Use centralized value for GAE (better value estimates).
                     let value = centralized_values[batch_idx];
 
-                    // Cache h2 and local_value for critic/mixer update (avoid re-forwarding).
+                    // Cache h2 (flat), local_value for critic/mixer update.
                     let h2_start = batch_idx * hidden;
-                    cached_h2.push(h2_flat_a[h2_start..h2_start + hidden].to_vec());
+                    cached_h2_flat.extend_from_slice(&h2_flat_a[h2_start..h2_start + hidden]);
                     cached_local_values.push(local_value);
+                    cached_team_rewards.push(per_drone_team_reward);
 
                     rollout.push(Transition {
                         ego_obs: ego_refs_a[batch_idx].clone(),
                         entity_obs: ent_refs_a[batch_idx].clone(),
+                        raw_entity_obs: ent_refs_a[batch_idx].clone(),
                         n_entities: nent_a[batch_idx],
                         action,
-                        reward: result.reward + individual_reward,
+                        reward: per_drone_team_reward + individual_reward,
                         value,
                         log_prob,
-                        done,
+                        done: terminated,
+                        truncated,
+                        drone_id,
                         drone_died,
-                        team_value_at_death: if drone_died { value } else { 0.0 },
+                        // Dead drone: bootstrap with centralized critic value (team continues).
+                        team_value_at_death: if drone_died { centralized_values[batch_idx] } else { 0.0 },
                     });
                     rollout_env_indices.push(env_idx);
+                    rollout_step_indices.push(_step);
                 }
 
-                if done {
+                if terminated || truncated {
                     ep_rewards.push(ep_reward_accum[env_idx]);
                     ep_reward_accum[env_idx] = 0.0;
                     let new_seed = total_steps + env_idx as u64;
 
-                    // Per-env smooth curriculum on reset.
-                    let (d, t) = curriculum_config_smooth(
-                        progress, new_seed, config.drones_per_side, config.targets_per_side,
-                    );
+                    // Per-env curriculum config (blended during transitions).
+                    let stage = curriculum.config_for_env(new_seed);
+
+                    // Reassign opponent type: doctrine fraction decays over training.
+                    let doc_frac = doctrine_fraction(curriculum.current_stage);
+                    let new_opponent = if (new_seed % 1000) < (doc_frac * 1000.0) as u64 {
+                        OpponentType::Doctrine
+                    } else {
+                        OpponentType::SelfPlay
+                    };
+
+                    let mut sc = make_sim_config(&config, stage.world_size);
+                    sc.drones_per_side = stage.drones_per_side;
+                    sc.targets_per_side = stage.targets_per_side;
+                    sc.seed = new_seed;
+                    sc.randomize_opponent = new_opponent == OpponentType::Doctrine;
                     let env_cfg = envs[env_idx].config();
-                    if env_cfg.drones_per_side != d || env_cfg.targets_per_side != t {
-                        let mut sc = make_sim_config(&config);
-                        sc.drones_per_side = d;
-                        sc.targets_per_side = t;
-                        sc.seed = new_seed;
+                    if env_cfg.drones_per_side != sc.drones_per_side || env_cfg.targets_per_side != sc.targets_per_side || env_cfg.world_size != sc.world_size || sc.randomize_opponent != env_cfg.randomize_opponent {
                         envs[env_idx] = SimRunner::new(sc);
                     }
                     let ((obs_a, drone_ids_a), (obs_b, drone_ids_b)) =
                         envs[env_idx].reset_selfplay_with_seed(new_seed);
-                    env_states[env_idx] = EnvState { obs_a, drone_ids_a, obs_b, drone_ids_b };
+                    env_states[env_idx] = EnvState {
+                        obs_a, drone_ids_a, obs_b, drone_ids_b,
+                        opponent_type: new_opponent,
+                    };
                 } else {
+                    let old_opponent = env_states[env_idx].opponent_type;
                     env_states[env_idx] = EnvState {
                         obs_a: result.obs_a.clone(),
                         drone_ids_a: result.drone_ids_a.clone(),
                         obs_b: result.obs_b.clone(),
                         drone_ids_b: result.drone_ids_b.clone(),
+                        opponent_type: old_opponent,
                     };
                 }
-                total_steps += 1;
             }
+            // Count total env transitions per rollout step (standard PPO convention).
+            total_steps += config.n_envs as u64;
         }
 
         if rollout.is_empty() { continue; }
 
-        // Update running normalizers with this rollout's raw observations.
+        // Update ego running normalizer with this rollout's raw observations.
+        // Entity normalizer update is skipped: entity features are pre-normalized in obs_encoding.
         let ego_batch_size = raw_ego_batch.len() / EGO_DIM;
         if ego_batch_size > 0 {
             ego_normalizer.update_batch(&raw_ego_batch, ego_batch_size);
         }
-        if raw_ent_count > 0 {
-            entity_normalizer.update_batch(&raw_ent_batch, raw_ent_count);
-        }
         raw_ego_batch.clear();
-        raw_ent_batch.clear();
-        raw_ent_count = 0;
 
-        // Compute last values for GAE using centralized critic.
+        // Compute last values for GAE using local_value (consistent baseline).
         let hidden = config.hidden_size;
-        let mut last_values = vec![0.0f32; config.n_envs];
+        // Per-(env, drone) last values for per-drone GAE.
+        let mut last_values_map: HashMap<(usize, usize), f32> = HashMap::new();
         {
             let mut boot_egos: Vec<Vec<f32>> = Vec::new();
             let mut boot_ents: Vec<Vec<f32>> = Vec::new();
             let mut boot_nents: Vec<usize> = Vec::new();
-            let mut boot_map: Vec<(usize, usize)> = Vec::new();
+            let mut boot_keys: Vec<(usize, usize)> = Vec::new(); // (env_idx, drone_id)
             for (env_idx, env_st) in env_states.iter().enumerate() {
-                if env_st.obs_a.is_empty() { continue; }
-                let start = boot_egos.len();
-                for obs in &env_st.obs_a {
+                for (obs_i, obs) in env_st.obs_a.iter().enumerate() {
                     let norm = normalize_obs(obs, &ego_normalizer, &entity_normalizer);
                     boot_egos.push(norm.ego);
                     boot_ents.push(norm.entities);
                     boot_nents.push(norm.n_entities);
+                    let drone_id = env_st.drone_ids_a.get(obs_i).copied().unwrap_or(0);
+                    boot_keys.push((env_idx, drone_id));
                 }
-                boot_map.push((env_idx, boot_egos.len() - start));
             }
             if !boot_egos.is_empty() {
                 let e_sl: Vec<&[f32]> = boot_egos.iter().map(|e| e.as_slice()).collect();
                 let ent_sl: Vec<&[f32]> = boot_ents.iter().map(|e| e.as_slice()).collect();
-                let (results, h2_boot) = policy.act_batch_with_h2(&e_sl, &ent_sl, &boot_nents, &mut rng);
-                let mut offset = 0;
-                for &(env_idx, count) in &boot_map {
-                    // Compute mean pool of h2 for this env's bootstrap obs.
-                    let mut mean_pool = vec![0.0f32; hidden];
-                    for i in 0..count {
-                        for j in 0..hidden { mean_pool[j] += h2_boot[(offset + i) * hidden + j]; }
+                let (_results, h2_boot) = policy.act_batch_with_h2_masked(&e_sl, &ent_sl, &boot_nents, Some(&ent_sl), &mut rng);
+
+                // Compute per-env mean pools from bootstrap h2 values.
+                let boot_total = boot_egos.len();
+                let mut boot_env_offsets: Vec<(usize, usize)> = Vec::new(); // (start, count) per env
+                {
+                    let mut offset = 0usize;
+                    for env_st in env_states.iter() {
+                        let count = env_st.obs_a.len();
+                        boot_env_offsets.push((offset, count));
+                        offset += count;
                     }
-                    let inv_n = 1.0 / count as f32;
-                    for j in 0..hidden { mean_pool[j] *= inv_n; }
-                    // Centralized value for each drone, averaged.
-                    let mut sum = 0.0f32;
+                }
+
+                let boot_mean_pools: Vec<Vec<f32>> = boot_env_offsets.iter().map(|&(start, count)| {
+                    if count == 0 { return vec![0.0f32; hidden]; }
+                    let mut pool = vec![0.0f32; hidden];
                     for i in 0..count {
-                        let h2_i = &h2_boot[(offset + i) * hidden..(offset + i + 1) * hidden];
-                        sum += critic.forward(h2_i, &mean_pool);
+                        let idx = start + i;
+                        for j in 0..hidden { pool[j] += h2_boot[idx * hidden + j]; }
                     }
-                    last_values[env_idx] = sum / count as f32;
-                    offset += count;
+                    let inv = 1.0 / count as f32;
+                    for j in 0..hidden { pool[j] *= inv; }
+                    pool
+                }).collect();
+
+                // Build critic input for bootstrap values.
+                let critic_in_dim = 2 * hidden;
+                let mut boot_critic_input = vec![0.0f32; boot_total * critic_in_dim];
+                for (env_idx, &(start, count)) in boot_env_offsets.iter().enumerate() {
+                    for i in 0..count {
+                        let idx = start + i;
+                        let dst = idx * critic_in_dim;
+                        boot_critic_input[dst..dst + hidden].copy_from_slice(
+                            &h2_boot[idx * hidden..(idx + 1) * hidden]);
+                        boot_critic_input[dst + hidden..dst + critic_in_dim].copy_from_slice(
+                            &boot_mean_pools[env_idx]);
+                    }
+                }
+
+                // Batched critic forward for bootstrap values.
+                let bc_h1 = matmul_bias_relu(&boot_critic_input, &critic.fc1.weights, &critic.fc1.biases,
+                    boot_total, critic.fc1.out_dim, critic_in_dim, true);
+                let bc_h2 = matmul_bias_relu(&bc_h1, &critic.fc2.weights, &critic.fc2.biases,
+                    boot_total, critic.fc2.out_dim, critic.fc2.in_dim, true);
+                let boot_centralized_values = matmul_bias_relu(&bc_h2, &critic.value_head.weights, &critic.value_head.biases,
+                    boot_total, 1, critic.value_head.in_dim, false);
+
+                for (i, &(env_idx, drone_id)) in boot_keys.iter().enumerate() {
+                    last_values_map.insert((env_idx, drone_id), boot_centralized_values[i]);
                 }
             }
         }
 
-        // Split rollout by env for GAE.
-        let mut env_rollouts: Vec<Vec<(usize, &Transition)>> = vec![Vec::new(); config.n_envs];
+        // Split rollout by (env, drone) for per-drone GAE.
+        let mut drone_rollouts: HashMap<(usize, usize), Vec<(usize, &Transition)>> = HashMap::new();
         for (i, (trans, &env_idx)) in rollout.iter().zip(rollout_env_indices.iter()).enumerate() {
-            env_rollouts[env_idx].push((i, trans));
+            drone_rollouts.entry((env_idx, trans.drone_id)).or_default().push((i, trans));
         }
         let mut advantages = vec![0.0f32; rollout.len()];
         let mut returns = vec![0.0f32; rollout.len()];
-        for env_idx in 0..config.n_envs {
-            let env_trans: Vec<Transition> = env_rollouts[env_idx].iter().map(|(_, t)| (*t).clone()).collect();
-            if env_trans.is_empty() { continue; }
-            let (adv, ret) = compute_gae(&env_trans, last_values[env_idx], config.gamma, config.lam);
-            for (j, &(global_idx, _)) in env_rollouts[env_idx].iter().enumerate() {
-                advantages[global_idx] = adv[j];
-                returns[global_idx] = ret[j];
+        for (&(env_idx, drone_id), group) in &drone_rollouts {
+            if group.is_empty() { continue; }
+            let last_val = last_values_map.get(&(env_idx, drone_id)).copied().unwrap_or(0.0);
+            // Compute GAE directly from references to avoid cloning transitions.
+            let n = group.len();
+            let mut gae = 0.0f32;
+            for j in (0..n).rev() {
+                let t = group[j].1;
+                let next_value = if j + 1 < n { group[j + 1].1.value } else { last_val };
+                let next_non_terminal = if t.done && !t.truncated {
+                    0.0
+                } else if t.truncated {
+                    1.0
+                } else if t.drone_died {
+                    gae = 0.0;
+                    let bootstrap = t.team_value_at_death;
+                    let delta = t.reward + config.gamma * bootstrap - t.value;
+                    advantages[group[j].0] = delta;
+                    returns[group[j].0] = delta + t.value;
+                    continue;
+                } else {
+                    1.0
+                };
+                let delta = t.reward + config.gamma * next_value * next_non_terminal - t.value;
+                gae = delta + config.gamma * config.lam * next_non_terminal * gae;
+                advantages[group[j].0] = gae;
+                returns[group[j].0] = gae + t.value;
+            }
+        }
+
+        // Compute team-only returns for critic training (separate from mixed PPO returns).
+        let mut team_returns = vec![0.0f32; rollout.len()];
+        for ((_env_idx, _drone_id), group) in &drone_rollouts {
+            // Simple discounted return of team-only rewards within each drone trajectory.
+            // Reset at drone_died boundaries (drone's trajectory ends, team continues without it).
+            let mut g = 0.0f32;
+            for &(global_idx, _) in group.iter().rev() {
+                let t = &rollout[global_idx];
+                if t.drone_died && !t.done {
+                    g = 0.0; // Drone's trajectory ends here
+                }
+                let done_flag = if t.done && !t.truncated { 0.0 } else { 1.0 };
+                g = cached_team_rewards[global_idx] + config.gamma * done_flag * g;
+                team_returns[global_idx] = g;
             }
         }
 
@@ -594,11 +701,108 @@ fn main() {
         for a in &mut advantages { *a = (*a - adv_mean) / adv_std; }
 
         // Anneal LR and entropy.
-        let progress = (total_steps as f32 / config.total_timesteps as f32).min(1.0);
-        let current_lr = config.lr * (1.0 - progress);
-        let current_ent_coef = config.ent_coef_start + (config.ent_coef_end - config.ent_coef_start) * progress;
+        // Use update_count for progress when --timesteps 0 (infinite mode).
+        let progress = if config.total_timesteps == 0 {
+            (update_count as f32 / 500.0).min(1.0) // Anneal over ~500 updates
+        } else {
+            (total_steps as f32 / config.total_timesteps as f32).min(1.0)
+        };
+        let current_lr = config.lr * (1.0 - progress).max(0.1); // Floor at 10% of initial LR
+        // Cosine decay for entropy.
+        let current_ent_coef = config.ent_coef_end + 0.5 * (config.ent_coef_start - config.ent_coef_end) * (1.0 + (std::f32::consts::PI * progress).cos());
 
-        // PPO update with parallel backward.
+        // ================================================================
+        // MAPPO Critic + QMIX Mixer update BEFORE PPO (h2 is still fresh).
+        // ================================================================
+        {
+            critic.zero_grad();
+            mixer.zero_grad();
+            let mut critic_samples = 0usize;
+            let mut mixer_samples = 0usize;
+
+            // Batched critic update using cached h2 and per-step mean_pools.
+            let critic_in_dim = 2 * hidden;
+            let n_total = rollout.len();
+            if n_total > 0 {
+                // Build flat critic input using per-(step, env) cached mean_pools.
+                let mut c_input = vec![0.0f32; n_total * critic_in_dim];
+                for i in 0..n_total {
+                    let dst = i * critic_in_dim;
+                    c_input[dst..dst + hidden].copy_from_slice(&cached_h2_flat[i * hidden..(i + 1) * hidden]);
+                    let pool_idx = rollout_step_indices[i] * config.n_envs + rollout_env_indices[i];
+                    c_input[dst + hidden..dst + critic_in_dim].copy_from_slice(&step_mean_pools[pool_idx]);
+                }
+
+                // Batched forward through critic.
+                let ch1 = matmul_bias_relu(&c_input, &critic.fc1.weights, &critic.fc1.biases,
+                    n_total, critic.fc1.out_dim, critic_in_dim, true);
+                let ch2 = matmul_bias_relu(&ch1, &critic.fc2.weights, &critic.fc2.biases,
+                    n_total, critic.fc2.out_dim, critic.fc2.in_dim, true);
+                let c_vals = matmul_bias_relu(&ch2, &critic.value_head.weights, &critic.value_head.biases,
+                    n_total, 1, critic.value_head.in_dim, false);
+
+                // Strided subsample for critic backward.
+                let critic_budget = (config.batch_size * 8).min(n_total);
+                let stride = n_total / critic_budget.max(1);
+                let mut critic_count = 0usize;
+                for k in 0..critic_budget {
+                    let i = (k * stride).min(n_total - 1);
+                    let d = MAPPO_VF_COEF * 2.0 * (c_vals[i] - team_returns[i]);
+                    let pool_idx = rollout_step_indices[i] * config.n_envs + rollout_env_indices[i];
+                    critic.forward(&cached_h2_flat[i * hidden..(i + 1) * hidden], &step_mean_pools[pool_idx]);
+                    critic.backward(d);
+                    critic_count += 1;
+                }
+                critic_samples = critic_count;
+            }
+
+            // QMIX update: group by (env, step) for per-timestep credit assignment.
+            let mut step_groups: HashMap<(usize, usize), Vec<usize>> = HashMap::new();
+            for (i, (&env_idx, &step_idx)) in rollout_env_indices.iter().zip(rollout_step_indices.iter()).enumerate() {
+                step_groups.entry((env_idx, step_idx)).or_default().push(i);
+            }
+            for (_env_idx, group) in &step_groups {
+                if group.len() < 2 { continue; }
+                let n_agents = group.len().min(MAX_AGENTS);
+                let local_vals: Vec<f32> = group.iter().take(n_agents)
+                    .map(|&gi| cached_local_values[gi]).collect();
+                let team_return: f32 = group.iter().map(|&gi| team_returns[gi]).sum::<f32>() / group.len() as f32;
+
+                let mut global_state = vec![0.0f32; hidden + GLOBAL_OBS_FEATURES];
+                for &gi in group.iter().take(n_agents) {
+                    for j in 0..hidden { global_state[j] += cached_h2_flat[gi * hidden + j]; }
+                }
+                let inv = 1.0 / n_agents as f32;
+                for j in 0..hidden { global_state[j] *= inv; }
+
+                let sample_ego = &rollout[group[0]].ego_obs;
+                if sample_ego.len() >= 25 {
+                    for k in 0..GLOBAL_OBS_FEATURES.min(8) {
+                        global_state[hidden + k] = sample_ego[17 + k];
+                    }
+                }
+
+                let team_val = mixer.forward(&local_vals, &global_state, n_agents);
+                let d_mixer = QMIX_COEF * 2.0 * (team_val - team_return);
+                mixer.backward(d_mixer);
+                mixer_samples += 1;
+            }
+
+            if critic_samples > 0 {
+                critic.clip_grad_norm(config.max_grad_norm);
+                critic_step_count += 1;
+                critic.adam_step(current_lr, critic_samples, 0.9, 0.999, 1e-8, 5e-4, critic_step_count);
+            }
+            if mixer_samples > 0 {
+                mixer.clip_grad_norm(config.max_grad_norm);
+                mixer_step_count += 1;
+                mixer.adam_step(current_lr, mixer_samples, 0.9, 0.999, 1e-8, 5e-4, mixer_step_count);
+            }
+        }
+
+        // ================================================================
+        // PPO update (after critic/QMIX so h2 was fresh for them).
+        // ================================================================
         let chunk_size = (config.batch_size + n_threads - 1) / n_threads;
         let mut thread_policies: Vec<PolicyNetV2> = (0..n_threads).map(|_| policy.clone()).collect();
 
@@ -631,12 +835,13 @@ fn main() {
                                 &t.ego_obs,
                                 &t.entity_obs,
                                 t.n_entities,
+                                &t.entity_obs,
                                 t.action,
                                 advantages[idx],
                                 returns[idx],
                                 t.log_prob,
                                 config.clip_range,
-                                config.vf_coef,
+                                0.0, // vf_coef=0: local_value_head disabled; centralized critic handles value prediction
                                 current_ent_coef,
                             );
                         }
@@ -649,98 +854,6 @@ fn main() {
                 policy.clip_grad_norm(config.max_grad_norm);
                 adam_step_count += 1;
                 policy.adam_step(current_lr, batch_size, 0.9, 0.999, 1e-8, 5e-4, adam_step_count);
-            }
-        }
-
-        // ================================================================
-        // MAPPO Critic + QMIX Mixer update (using cached h2/local_values)
-        // ================================================================
-        {
-            critic.zero_grad();
-            mixer.zero_grad();
-            let mut critic_samples = 0usize;
-            let mut mixer_samples = 0usize;
-
-            // Batched critic update using cached h2 (no re-forwarding).
-            let critic_in_dim = 2 * hidden;
-            let n_total = rollout.len();
-            if n_total > 0 {
-                // Build per-env mean_pools from cached h2.
-                let mut env_mean_pools: Vec<Vec<f32>> = vec![vec![0.0f32; hidden]; config.n_envs];
-                let mut env_counts: Vec<usize> = vec![0; config.n_envs];
-                for (i, &env_idx) in rollout_env_indices.iter().enumerate() {
-                    for j in 0..hidden { env_mean_pools[env_idx][j] += cached_h2[i][j]; }
-                    env_counts[env_idx] += 1;
-                }
-                for env_idx in 0..config.n_envs {
-                    if env_counts[env_idx] > 0 {
-                        let inv = 1.0 / env_counts[env_idx] as f32;
-                        for j in 0..hidden { env_mean_pools[env_idx][j] *= inv; }
-                    }
-                }
-
-                // Build flat critic input: concat(h2_i, mean_pool_env) for all transitions.
-                let mut c_input = vec![0.0f32; n_total * critic_in_dim];
-                for (i, &env_idx) in rollout_env_indices.iter().enumerate() {
-                    let dst = i * critic_in_dim;
-                    c_input[dst..dst + hidden].copy_from_slice(&cached_h2[i]);
-                    c_input[dst + hidden..dst + critic_in_dim].copy_from_slice(&env_mean_pools[env_idx]);
-                }
-
-                // Batched forward through critic.
-                let ch1 = matmul_bias_relu(&c_input, &critic.fc1.weights, &critic.fc1.biases,
-                    n_total, critic.fc1.out_dim, critic_in_dim, true);
-                let ch2 = matmul_bias_relu(&ch1, &critic.fc2.weights, &critic.fc2.biases,
-                    n_total, critic.fc2.out_dim, critic.fc2.in_dim, true);
-                let c_vals = matmul_bias_relu(&ch2, &critic.value_head.weights, &critic.value_head.biases,
-                    n_total, 1, critic.value_head.in_dim, false);
-
-                // Subsample for critic backward (full rollout is too large).
-                // Use at most batch_size samples for gradient computation.
-                let critic_batch = n_total.min(config.batch_size);
-                let stride = n_total / critic_batch.max(1);
-                for k in 0..critic_batch {
-                    let i = (k * stride) % n_total;
-                    let d = MAPPO_VF_COEF * 2.0 * (c_vals[i] - returns[i]);
-                    critic.forward(&cached_h2[i], &env_mean_pools[rollout_env_indices[i]]);
-                    critic.backward(d);
-                }
-                critic_samples = critic_batch;
-            }
-
-            // QMIX update: group by env, use cached local values.
-            let mut step_groups: HashMap<usize, Vec<usize>> = HashMap::new();
-            for (i, &env_idx) in rollout_env_indices.iter().enumerate() {
-                step_groups.entry(env_idx).or_default().push(i);
-            }
-            for (&env_idx, group) in &step_groups {
-                if group.len() < 2 { continue; }
-                let n_agents = group.len().min(MAX_AGENTS);
-                let local_vals: Vec<f32> = group.iter().take(n_agents)
-                    .map(|&gi| cached_local_values[gi]).collect();
-                let team_return: f32 = group.iter().map(|&gi| returns[gi]).sum::<f32>() / group.len() as f32;
-
-                // Global state from cached h2 mean pool.
-                let mut global_state = vec![0.0f32; hidden + GLOBAL_OBS_FEATURES];
-                for &gi in group.iter().take(n_agents) {
-                    for j in 0..hidden { global_state[j] += cached_h2[gi][j]; }
-                }
-                let inv = 1.0 / n_agents as f32;
-                for j in 0..hidden { global_state[j] *= inv; }
-
-                let team_val = mixer.forward(&local_vals, &global_state, n_agents);
-                let d_mixer = QMIX_COEF * 2.0 * (team_val - team_return);
-                mixer.backward(d_mixer);
-                mixer_samples += 1;
-            }
-
-            if critic_samples > 0 {
-                critic.clip_grad_norm(config.max_grad_norm);
-                critic.adam_step(current_lr, critic_samples, 0.9, 0.999, 1e-8, 5e-4, adam_step_count);
-            }
-            if mixer_samples > 0 {
-                mixer.clip_grad_norm(config.max_grad_norm);
-                mixer.adam_step(current_lr, mixer_samples, 0.9, 0.999, 1e-8, 5e-4, adam_step_count);
             }
         }
 
@@ -782,31 +895,95 @@ fn main() {
             let elapsed = start_time.elapsed().as_secs();
             let fps = total_steps as f64 / elapsed.max(1) as f64;
             println!(
-                "Update {}: steps={}, eps={}, mean_r={:.2}, trans={}, fps={:.0}, {}s, {}v{}",
-                update_count, total_steps, ep_rewards.len(), mean_reward, n, fps, elapsed, curr_drones, curr_drones,
+                "Update {}: steps={}, eps={}, mean_r={:.2}, trans={}, fps={:.0}, {}s, {}",
+                update_count, total_steps, ep_rewards.len(), mean_reward, n, fps, elapsed, curriculum.stage_label(),
             );
         }
 
         // Evaluate.
         if update_count % config.eval_freq as u64 == 0 {
             let eval_seed = total_steps * 997 + update_count * 31;
-            let (win_rate, mean_reward, mean_length) = evaluate(&policy, &ego_normalizer, &entity_normalizer, &config, eval_seed);
-            println!("  Eval: win_A={:.1}%, reward={:.2}, len={:.0}",
-                win_rate * 100.0, mean_reward, mean_length);
+            let (win_rate, mean_reward, mean_length) = evaluate(&policy, &ego_normalizer, &entity_normalizer, &config, curriculum.current(), eval_seed);
+            println!("  Eval: win_A={:.1}%, reward={:.2}, len={:.0}, stage={}",
+                win_rate * 100.0, mean_reward, mean_length, curriculum.stage_label());
+
+            // Win-rate-based curriculum advancement.
+            let stage_change = curriculum.report_eval(win_rate);
+            if stage_change == Some(true) {
+                let _new_stage = curriculum.current();
+                println!("  >>> Curriculum advanced to {} (win_rate={:.1}% exceeded {:.0}% threshold)",
+                    curriculum.stage_label(), win_rate * 100.0, curriculum.advance_threshold * 100.0);
+                // Recreate all envs at new stage.
+                for i in 0..config.n_envs {
+                    let stage = curriculum.config_for_env(i as u64);
+                    let doc_frac = doctrine_fraction(curriculum.current_stage);
+                    let opp = if (i as f32 / config.n_envs as f32) < doc_frac {
+                        OpponentType::Doctrine
+                    } else {
+                        OpponentType::SelfPlay
+                    };
+                    let mut sc = make_sim_config(&config, stage.world_size);
+                    sc.drones_per_side = stage.drones_per_side;
+                    sc.targets_per_side = stage.targets_per_side;
+                    sc.seed = total_steps + i as u64;
+                    sc.randomize_opponent = opp == OpponentType::Doctrine;
+                    envs[i] = SimRunner::new(sc);
+                    let (obs_a, drone_ids_a) = envs[i].observe_multi_group_v2(0);
+                    let (obs_b, drone_ids_b) = envs[i].observe_multi_group_v2(1);
+                    env_states[i] = EnvState { obs_a, drone_ids_a, obs_b, drone_ids_b, opponent_type: opp };
+                    ep_reward_accum[i] = 0.0;
+                }
+                // Reset best_win_rate for the new stage.
+                best_win_rate = 0.0;
+            } else if stage_change == Some(false) {
+                println!("  <<< Curriculum demoted to {} (win_rate={:.1}% below {:.0}% threshold)",
+                    curriculum.stage_label(), win_rate * 100.0, 30.0);
+                // Recreate all envs at demoted stage.
+                for i in 0..config.n_envs {
+                    let stage = curriculum.config_for_env(i as u64);
+                    let mut sc = make_sim_config(&config, stage.world_size);
+                    sc.drones_per_side = stage.drones_per_side;
+                    sc.targets_per_side = stage.targets_per_side;
+                    sc.seed = total_steps + i as u64;
+                    sc.randomize_opponent = true;
+                    envs[i] = SimRunner::new(sc);
+                    let (obs_a, drone_ids_a) = envs[i].observe_multi_group_v2(0);
+                    let (obs_b, drone_ids_b) = envs[i].observe_multi_group_v2(1);
+                    env_states[i] = EnvState { obs_a, drone_ids_a, obs_b, drone_ids_b, opponent_type: OpponentType::Doctrine };
+                    ep_reward_accum[i] = 0.0;
+                }
+                best_win_rate = 0.0;
+            }
 
             let ckpt_path = format!("{}/checkpoint_{}.json", config.output_dir, update_count);
             policy.save(&ckpt_path).ok();
+            save_normalizers(&ckpt_path, &ego_normalizer, &entity_normalizer);
 
             if win_rate > best_win_rate {
                 best_win_rate = win_rate;
                 policy.save(&best_model_path).ok();
+                save_normalizers(&best_model_path, &ego_normalizer, &entity_normalizer);
                 println!("  New best model (win={:.1}%)", win_rate * 100.0);
             }
         }
     }
 
     policy.save(&final_model_path).ok();
+    save_normalizers(&final_model_path, &ego_normalizer, &entity_normalizer);
     println!("\nTraining complete. Steps: {}, Best win: {:.1}%", total_steps, best_win_rate * 100.0);
+}
+
+/// Save normalizer stats alongside a model file.
+/// Creates a `_normalizers.json` companion file.
+fn save_normalizers(model_path: &str, ego_norm: &RunningMeanStd, ent_norm: &RunningMeanStd) {
+    let norm_path = model_path.replace(".json", "_normalizers.json");
+    let data = serde_json::json!({
+        "ego": { "mean": ego_norm.mean, "var": ego_norm.var, "skip_indices": ego_norm.skip_indices },
+        "entity": { "mean": ent_norm.mean, "var": ent_norm.var, "skip_indices": ent_norm.skip_indices },
+    });
+    if let Ok(json) = serde_json::to_string(&data) {
+        std::fs::write(&norm_path, json).ok();
+    }
 }
 
 fn parse_args() -> TrainConfig {
@@ -829,6 +1006,7 @@ fn parse_args() -> TrainConfig {
             "--n-epochs" => { i += 1; config.n_epochs = args[i].parse().unwrap(); }
             "--eval-episodes" => { i += 1; config.eval_episodes = args[i].parse().unwrap(); }
             "--opponent-update-freq" => { i += 1; config.opponent_update_freq = args[i].parse().unwrap(); }
+            "--resume" => { i += 1; config.resume = Some(args[i].clone()); }
             "--help" | "-h" => {
                 println!("Usage: train [OPTIONS]");
                 println!("  --timesteps N             Total training steps (default 50000000)");

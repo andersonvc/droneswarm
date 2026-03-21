@@ -37,6 +37,7 @@ import init, {
     update_doctrine_targets,
     load_rl_model,
     load_rl_model_multi,
+    load_rl_normalizers,
     set_rl_agent_enabled,
     update_rl_targets,
     remove_rl_agent,
@@ -119,7 +120,7 @@ export class SwarmManager {
                 simulationTime: 0,
                 droneCount: 0,
                 selectedCount: 0,
-                speedMultiplier: 8.0,
+                speedMultiplier: 16.0,
                 isValid: false,
             };
         }
@@ -333,6 +334,11 @@ export class SwarmManager {
             initialFriendlyTargets,
             initialEnemyTargets,
         );
+    }
+
+    loadRlNormalizers(group: number, normalizerJson: string): void {
+        if (!this.handle) return;
+        load_rl_normalizers(this.handle, group, normalizerJson);
     }
 
     setRlAgentEnabled(group: number, enabled: boolean): void {

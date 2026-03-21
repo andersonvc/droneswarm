@@ -54,19 +54,30 @@ pub struct InferenceNet {
 ///
 /// Stores the running mean and variance computed during training.
 /// Applied to observations before feeding them to the network.
+/// Supports skip_indices for categorical dimensions.
 #[derive(Clone, Deserialize)]
 pub struct ObsNormalizer {
     pub mean: Vec<f32>,
     pub var: Vec<f32>,
+    #[serde(default)]
+    pub skip_indices: Vec<usize>,
 }
 
 impl ObsNormalizer {
     /// Normalize a single observation: `(x - mean) / sqrt(var + 1e-8)`, clipped to [-10, 10].
+    /// Skipped indices are passed through unchanged.
     pub fn normalize(&self, input: &[f32]) -> Vec<f32> {
         input
             .iter()
+            .enumerate()
             .zip(self.mean.iter().zip(self.var.iter()))
-            .map(|(&x, (&m, &v))| ((x - m) / (v + 1e-8).sqrt()).clamp(-10.0, 10.0))
+            .map(|((d, &x), (&m, &v))| {
+                if self.skip_indices.contains(&d) {
+                    x
+                } else {
+                    ((x - m) / (v + 1e-8).sqrt()).clamp(-10.0, 10.0)
+                }
+            })
             .collect()
     }
 }
@@ -74,6 +85,32 @@ impl ObsNormalizer {
 // ============================================================================
 // V2 Inference: Entity-Attention Policy Network
 // ============================================================================
+
+/// Inference-only layer normalization.
+///
+/// Mirrors training LayerNorm without gradient caches or Adam state.
+#[derive(Clone, Deserialize)]
+pub struct InferenceLayerNorm {
+    pub gamma: Vec<f32>,
+    pub beta: Vec<f32>,
+    pub dim: usize,
+}
+
+impl InferenceLayerNorm {
+    /// Forward pass for a single vector of length `dim`.
+    pub fn forward(&self, x: &[f32]) -> Vec<f32> {
+        let n = self.dim as f32;
+        let mean: f32 = x.iter().sum::<f32>() / n;
+        let var: f32 = x.iter().map(|&v| (v - mean) * (v - mean)).sum::<f32>() / n;
+        let std = (var + 1e-5).sqrt();
+        let mut out = Vec::with_capacity(self.dim);
+        for i in 0..self.dim {
+            let normed = (x[i] - mean) / std;
+            out.push(self.gamma[i] * normed + self.beta[i]);
+        }
+        out
+    }
+}
 
 /// Inference-only multi-head self-attention.
 ///
@@ -84,6 +121,7 @@ pub struct InferenceAttention {
     pub w_k: DenseLayer,
     pub w_v: DenseLayer,
     pub w_o: DenseLayer,
+    pub layer_norm: InferenceLayerNorm,
     pub n_heads: usize,
     pub head_dim: usize,
     pub embed_dim: usize,
@@ -143,8 +181,11 @@ impl InferenceAttention {
                     *v = (*v - max).exp();
                     sum += *v;
                 }
-                for v in row.iter_mut() {
-                    *v /= sum;
+                if sum == 0.0 || sum.is_nan() {
+                    let uniform = 1.0 / n_entities as f32;
+                    for v in row.iter_mut() { *v = uniform; }
+                } else {
+                    for v in row.iter_mut() { *v /= sum; }
                 }
             }
 
@@ -166,7 +207,18 @@ impl InferenceAttention {
             let row = &concat_out[i * e..(i + 1) * e];
             output.extend_from_slice(&self.w_o.forward(row));
         }
-        output
+
+        // Residual connection: output += input entity_embeds.
+        for i in 0..n_entities * e {
+            output[i] += entity_embeds[i];
+        }
+
+        // Post-residual layer normalization (per entity).
+        let mut normed_output = Vec::with_capacity(n_entities * e);
+        for i in 0..n_entities {
+            normed_output.extend_from_slice(&self.layer_norm.forward(&output[i * e..(i + 1) * e]));
+        }
+        normed_output
     }
 }
 
@@ -175,13 +227,14 @@ impl InferenceAttention {
 /// Mirrors training PolicyNetV2 without gradients.
 /// Architecture:
 ///   ego → ego_encoder → ego_embed
-///   entities → entity_encoder → attention → mean_pool → pooled
+///   entities → entity_encoder → attn → attn2 → max_pool → pooled
 ///   concat(ego_embed, pooled) → fc1 → fc2 → actor_head → logits
 #[derive(Clone, Deserialize)]
 pub struct InferenceNetV2 {
     pub ego_encoder: DenseLayer,
     pub entity_encoder: DenseLayer,
     pub attn: InferenceAttention,
+    pub attn2: InferenceAttention,
     pub fc1: DenseLayer,
     pub fc2: DenseLayer,
     pub actor_head: DenseLayer,
@@ -199,6 +252,20 @@ impl InferenceNetV2 {
     /// Load from JSON string (same format as rl-train's PolicyNetV2::save).
     pub fn from_json(json: &str) -> Result<Self, String> {
         serde_json::from_str(json).map_err(|e| format!("Failed to parse V2 model JSON: {}", e))
+    }
+
+    /// Load normalizer stats from a companion JSON string.
+    /// Format: `{"ego": {"mean": [...], "var": [...], "skip_indices": [...]}, "entity": {...}}`
+    pub fn load_normalizers(&mut self, json: &str) -> Result<(), String> {
+        let val: serde_json::Value = serde_json::from_str(json)
+            .map_err(|e| format!("Failed to parse normalizer JSON: {}", e))?;
+        if let Some(ego) = val.get("ego") {
+            self.ego_normalizer = serde_json::from_value(ego.clone()).ok();
+        }
+        if let Some(ent) = val.get("entity") {
+            self.entity_normalizer = serde_json::from_value(ent.clone()).ok();
+        }
+        Ok(())
     }
 
     /// Forward pass. Returns action logits.
@@ -230,20 +297,20 @@ impl InferenceNetV2 {
             entity_embeds.extend_from_slice(&self.entity_encoder.forward(&ent_input));
         }
 
-        // 3. Self-attention.
+        // 3. Self-attention (2 stacked layers).
         let attn_out = if n_entities > 0 {
-            self.attn.forward(&entity_embeds, n_entities)
+            let attn_out1 = self.attn.forward(&entity_embeds, n_entities);
+            self.attn2.forward(&attn_out1, n_entities)
         } else {
             Vec::new()
         };
 
-        // 4. Mean pool.
+        // 4. Max pool.
         let pooled = if n_entities > 0 {
-            let inv_n = 1.0 / n_entities as f32;
-            let mut pool = vec![0.0f32; e];
+            let mut pool = vec![f32::NEG_INFINITY; e];
             for i in 0..n_entities {
                 for j in 0..e {
-                    pool[j] += attn_out[i * e + j] * inv_n;
+                    pool[j] = pool[j].max(attn_out[i * e + j]);
                 }
             }
             pool
@@ -262,7 +329,10 @@ impl InferenceNetV2 {
 
     /// Select the best action (argmax of logits).
     pub fn act(&self, ego: &[f32], entities: &[f32], n_entities: usize) -> u32 {
-        let logits = self.forward(ego, entities, n_entities);
+        let mut logits = self.forward(ego, entities, n_entities);
+        // Apply action mask: invalid actions get -inf.
+        let mask = crate::game::action_mask::compute_action_mask(entities, n_entities);
+        crate::game::action_mask::apply_mask_to_logits(&mut logits, &mask);
         let mut best = 0u32;
         let mut best_val = f32::NEG_INFINITY;
         for (i, &v) in logits.iter().enumerate() {

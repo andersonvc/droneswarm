@@ -1,6 +1,7 @@
 //! PPO backward pass implementation.
 
 use crate::network::policy::PolicyNet;
+use drone_lib::game::action_mask::{compute_action_mask, apply_mask_to_logits};
 use crate::network::policy_v2::PolicyNetV2;
 
 /// Softmax over a slice.
@@ -8,6 +9,10 @@ fn softmax(logits: &[f32]) -> Vec<f32> {
     let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     let exp: Vec<f32> = logits.iter().map(|&x| (x - max).exp()).collect();
     let sum: f32 = exp.iter().sum();
+    if sum == 0.0 || sum.is_nan() {
+        let uniform = 1.0 / logits.len() as f32;
+        return vec![uniform; logits.len()];
+    }
     exp.iter().map(|&e| e / sum).collect()
 }
 
@@ -46,9 +51,10 @@ impl PolicyNetPPOExt for PolicyNet {
         let new_log_prob = (probs[action as usize] + 1e-8).ln();
 
         // Policy gradient.
-        let ratio = (new_log_prob - old_log_prob).exp();
+        let ratio = (new_log_prob - old_log_prob).exp().clamp(0.05, 20.0);
+        let clipped_ratio = ratio.clamp(1.0 - clip_range, 1.0 + clip_range);
         let surr1 = ratio * advantage;
-        let surr2 = ratio.clamp(1.0 - clip_range, 1.0 + clip_range) * advantage;
+        let surr2 = clipped_ratio * advantage;
         let _policy_loss = -surr1.min(surr2);
 
         // Value loss.
@@ -62,14 +68,15 @@ impl PolicyNetPPOExt for PolicyNet {
         // Total loss gradient: d(policy_loss + vf_coef * value_loss - ent_coef * entropy) / d(logits, value)
 
         // -- Gradient of policy loss w.r.t. logits --
-        // d(policy_loss)/d(logits) via d(policy_loss)/d(probs) * d(probs)/d(logits)
-        // d(policy_loss)/d(log_prob_action) = -(ratio clipped gradient)
-        let clipped = ratio > 1.0 - clip_range && ratio < 1.0 + clip_range;
-        let use_surr1 = surr1 <= surr2;
-        let d_policy_d_logprob = if use_surr1 || clipped {
+        // PPO clips the gradient when ratio moves outside [1-eps, 1+eps]
+        // AND the unclipped surrogate is not the minimum.
+        let ratio_in_range = ratio > 1.0 - clip_range && ratio < 1.0 + clip_range;
+        let unclipped_is_min = surr1 <= surr2;
+        // Gradient flows through ratio when: unclipped is min, OR ratio is in range.
+        let d_policy_d_logprob = if unclipped_is_min || ratio_in_range {
             -advantage * ratio
         } else {
-            0.0 // clipped, no gradient
+            0.0 // clipped out, no gradient
         };
 
         // Softmax Jacobian: d(log_prob_a)/d(logit_j) = (1 if j==a) - prob_j
@@ -124,12 +131,13 @@ impl PolicyNetPPOExt for PolicyNet {
 /// Extension trait to add PPO-specific backward pass to PolicyNetV2.
 pub trait PolicyNetV2PPOExt {
     /// Backward pass for PPO loss on a single sample with entity-attention.
-    /// Accumulates gradients (caller should call adam_step after full batch).
+    /// `raw_entities` is unnormalized entity data for action masking.
     fn backward_ppo_v2(
         &mut self,
         ego: &[f32],
         entities: &[f32],
         n_entities: usize,
+        raw_entities: &[f32],
         action: u32,
         advantage: f32,
         ret: f32,
@@ -146,6 +154,7 @@ impl PolicyNetV2PPOExt for PolicyNetV2 {
         ego: &[f32],
         entities: &[f32],
         n_entities: usize,
+        raw_entities: &[f32],
         action: u32,
         advantage: f32,
         ret: f32,
@@ -155,19 +164,25 @@ impl PolicyNetV2PPOExt for PolicyNetV2 {
         ent_coef: f32,
     ) {
         // Forward pass (caches activations in each layer).
-        let (logits, value, _h2) = self.forward(ego, entities, n_entities);
+        let (mut logits, value, _h2) = self.forward(ego, entities, n_entities);
+
+        // Apply action mask using raw (unnormalized) entities.
+        let mask = compute_action_mask(raw_entities, n_entities);
+        apply_mask_to_logits(&mut logits, &mask);
+
         let probs = softmax(&logits);
         let new_log_prob = (probs[action as usize] + 1e-8).ln();
 
         // Policy gradient.
-        let ratio = (new_log_prob - old_log_prob).exp();
+        let ratio = (new_log_prob - old_log_prob).exp().clamp(0.05, 20.0);
+        let clipped_ratio = ratio.clamp(1.0 - clip_range, 1.0 + clip_range);
         let surr1 = ratio * advantage;
-        let surr2 = ratio.clamp(1.0 - clip_range, 1.0 + clip_range) * advantage;
+        let surr2 = clipped_ratio * advantage;
 
-        // Clipping logic.
-        let clipped = ratio > 1.0 - clip_range && ratio < 1.0 + clip_range;
-        let use_surr1 = surr1 <= surr2;
-        let d_policy_d_logprob = if use_surr1 || clipped {
+        // PPO clips gradient when ratio is outside range AND unclipped is not the min.
+        let ratio_in_range = ratio > 1.0 - clip_range && ratio < 1.0 + clip_range;
+        let unclipped_is_min = surr1 <= surr2;
+        let d_policy_d_logprob = if unclipped_is_min || ratio_in_range {
             -advantage * ratio
         } else {
             0.0

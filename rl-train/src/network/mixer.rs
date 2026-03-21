@@ -15,6 +15,12 @@ fn elu(x: f32) -> f32 {
     if x >= 0.0 { x } else { x.exp() - 1.0 }
 }
 
+/// Soft sign for abs() gradient: avoids dead gradient at zero.
+/// Returns sign(x) but clamps to 1.0 when |x| < epsilon.
+fn soft_sign(x: f32) -> f32 {
+    if x.abs() < 1e-6 { 1.0 } else { x.signum() }
+}
+
 /// ELU derivative: 1 if x >= 0, else exp(x).
 fn elu_deriv(x: f32) -> f32 {
     if x >= 0.0 { 1.0 } else { x.exp() }
@@ -163,8 +169,8 @@ impl QMIXMixer {
         let mut d_w2_raw = vec![0.0f32; qh];
         for j in 0..qh {
             let d_w2_j = grad_v_team * self.cache_hidden[j];
-            // d|x|/dx = sign(x)
-            d_w2_raw[j] = d_w2_j * self.cache_w2_raw[j].signum();
+            // d|x|/dx = sign(x), with soft_sign to avoid zero gradient at x=0.
+            d_w2_raw[j] = d_w2_j * soft_sign(self.cache_w2_raw[j]);
         }
         self.hyper_w2.backward(&d_w2_raw);
 
@@ -189,7 +195,7 @@ impl QMIXMixer {
         for i in 0..n {
             for j in 0..qh {
                 let d_w1_ij = d_hidden_pre[j] * self.cache_local_values[i];
-                d_w1_raw[i * qh + j] = d_w1_ij * self.cache_w1_raw[i * qh + j].signum();
+                d_w1_raw[i * qh + j] = d_w1_ij * soft_sign(self.cache_w1_raw[i * qh + j]);
             }
         }
         self.hyper_w1.backward(&d_w1_raw);

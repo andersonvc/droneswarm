@@ -110,14 +110,19 @@ export function checkWinCondition(currentDrones: { id: number }[]): void {
 
     if (aEliminated && bEliminated) {
         gameResult.set('draw');
-    } else if (bEliminated) {
+    } else if (bEliminated && !aEliminated) {
         gameResult.set('a_wins');
-    } else if (aEliminated) {
+    } else if (aEliminated && !bEliminated) {
         gameResult.set('b_wins');
     } else {
-        // Both have effective targets but game ended (a side lost all drones).
-        // The side that still has drones wins.
-        gameResult.set(groupAAlive > 0 ? 'a_wins' : 'b_wins');
+        // Both have effective targets. Compare who has more.
+        if (effA > effB) {
+            gameResult.set('a_wins');
+        } else if (effB > effA) {
+            gameResult.set('b_wins');
+        } else {
+            gameResult.set('draw');
+        }
     }
 }
 

@@ -6,8 +6,8 @@ use rl_train::network::PolicyNetV2;
 use rl_train::ppo::PolicyNetV2PPOExt;
 
 const EGO_DIM: usize = 25;
-const ENTITY_DIM: usize = 8;
-const ACT_DIM: usize = 19;
+const ENTITY_DIM: usize = 10;
+const ACT_DIM: usize = 13;
 const EMBED_DIM: usize = 64;
 const HIDDEN: usize = 256;
 
@@ -65,7 +65,7 @@ fn test_policy_v2_act_valid_action() {
     let ego = vec![0.3f32; EGO_DIM];
     let entities = vec![0.1f32; 2 * ENTITY_DIM];
 
-    let (action, log_prob, value) = net.act(&ego, &entities, 2, &mut rng);
+    let (action, log_prob, value) = net.act(&ego, &entities, 2, Some(&entities), &mut rng);
 
     assert!(
         (action as usize) < ACT_DIM,
@@ -201,14 +201,15 @@ fn test_policy_v2_backward_runs() {
     net.backward_ppo_v2(
         &ego,
         &entities,
-        2,       // n_entities
-        5,       // action
-        0.5,     // advantage
-        1.0,     // return
-        -2.0,    // old_log_prob
-        0.2,     // clip_range
-        0.5,     // vf_coef
-        0.01,    // ent_coef
+        2,            // n_entities
+        &entities,    // raw_entities (unnormalized, same in test)
+        5,            // action
+        0.5,          // advantage
+        1.0,          // return
+        -2.0,         // old_log_prob
+        0.2,          // clip_range
+        0.5,          // vf_coef
+        0.01,         // ent_coef
     );
 
     // Verify that at least some gradients are non-zero after backward.

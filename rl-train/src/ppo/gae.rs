@@ -5,10 +5,12 @@ use drone_lib::sim_runner::{EGO_DIM, ENTITY_DIM, MAX_ENTITIES, OBS_DIM_V2};
 /// A single rollout transition with V2 structured observations.
 #[derive(Clone)]
 pub struct Transition {
-    /// Ego features (EGO_DIM floats).
+    /// Ego features (EGO_DIM floats), normalized.
     pub ego_obs: Vec<f32>,
-    /// Entity tokens flattened (n_entities * ENTITY_DIM floats).
+    /// Entity tokens flattened (n_entities * ENTITY_DIM floats), normalized.
     pub entity_obs: Vec<f32>,
+    /// Raw (unnormalized) entity tokens for action masking.
+    pub raw_entity_obs: Vec<f32>,
     /// Number of real entities in entity_obs.
     pub n_entities: usize,
     pub action: u32,
@@ -17,6 +19,11 @@ pub struct Transition {
     pub value: f32,
     pub log_prob: f32,
     pub done: bool,
+    /// Episode ended due to time limit, not a true terminal state.
+    /// When truncated && done, GAE should bootstrap with V(s) instead of 0.
+    pub truncated: bool,
+    /// Which drone this transition belongs to (for per-drone GAE).
+    pub drone_id: usize,
     /// Drone died but episode continues (for death bootstrapping).
     pub drone_died: bool,
     /// Bootstrap value when drone dies mid-episode.
@@ -59,7 +66,8 @@ pub fn compute_gae(
         };
 
         // Determine the effective next value for bootstrapping.
-        let next_non_terminal = if transitions[i].done {
+        // Truncated episodes (time limit) are NOT terminal — bootstrap with V(s).
+        let next_non_terminal = if transitions[i].done && !transitions[i].truncated {
             0.0
         } else if transitions[i].drone_died {
             // Drone died but episode continues: bootstrap with team value.

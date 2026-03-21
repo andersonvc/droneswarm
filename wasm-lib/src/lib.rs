@@ -115,7 +115,7 @@ const RL_THREAT_RADIUS_MULTIPLIER: f32 = 5.0;
 /// Max drone velocity for per-drone obs normalization.
 const RL_MAX_VELOCITY: f32 = 20.0;
 /// Per-drone action dimensionality.
-const RL_ACT_DIM: usize = 19;
+const RL_ACT_DIM: usize = 13;
 /// Patrol standoff distance for RL patrol action.
 const RL_PATROL_STANDOFF: f32 = 200.0;
 
@@ -1034,6 +1034,14 @@ impl Swarm {
         Ok(())
     }
 
+    /// Load normalizer stats for an RL agent's model.
+    /// Should be called after load_rl_model/load_rl_model_multi.
+    pub fn load_rl_normalizers(&mut self, group: u32, normalizer_json: &str) -> Result<(), String> {
+        let agent = self.rl_agents.iter_mut().find(|a| a.group == group)
+            .ok_or_else(|| format!("No RL agent for group {}", group))?;
+        agent.model.load_normalizers(normalizer_json)
+    }
+
     /// Enable or disable the RL agent for a group.
     pub fn set_rl_agent_enabled(&mut self, group: u32, enabled: bool) {
         for agent in &mut self.rl_agents {
@@ -1319,8 +1327,10 @@ impl Swarm {
                         es.vel.as_vec2().x / RL_MAX_VELOCITY,
                         es.vel.as_vec2().y / RL_MAX_VELOCITY,
                         heading_rel,
-                        0.0, // ENEMY_DRONE type flag
+                        0.0, // ENEMY_DRONE type flag (entity_type::ENEMY_DRONE)
                         1.0, // alive
+                        0.0, // assignment_count
+                        0.0, // is_current_target
                     ]);
                 }
 
@@ -1343,8 +1353,10 @@ impl Swarm {
                         es.vel.as_vec2().x / RL_MAX_VELOCITY,
                         es.vel.as_vec2().y / RL_MAX_VELOCITY,
                         heading_rel,
-                        1.0, // FRIENDLY_DRONE type flag
+                        0.33, // FRIENDLY_DRONE type flag (entity_type::FRIENDLY_DRONE)
                         1.0,
+                        0.0, // assignment_count
+                        0.0, // is_current_target
                     ]);
                 }
 
@@ -1362,8 +1374,10 @@ impl Swarm {
                         dx / w, dy / w, dist / diag,
                         0.0, 0.0, // targets have no velocity
                         heading_rel,
-                        2.0, // ENEMY_TARGET type flag
+                        0.67, // ENEMY_TARGET type flag (entity_type::ENEMY_TARGET)
                         1.0,
+                        0.0, // assignment_count
+                        0.0, // is_current_target
                     ]);
                 }
 
@@ -1381,12 +1395,14 @@ impl Swarm {
                         dx / w, dy / w, dist / diag,
                         0.0, 0.0,
                         heading_rel,
-                        3.0, // FRIENDLY_TARGET type flag
+                        1.0, // FRIENDLY_TARGET type flag (entity_type::FRIENDLY_TARGET)
                         1.0,
+                        0.0, // assignment_count
+                        0.0, // is_current_target
                     ]);
                 }
 
-                let n_entities = entities.len() / 8;
+                let n_entities = entities.len() / 10;
 
                 // Run V2 policy.
                 let action = agent.model.act(&ego, &entities, n_entities);
@@ -1400,23 +1416,22 @@ impl Swarm {
         }
     }
 
-    /// Apply a per-drone RL action (0-18) to a specific drone.
+    /// Apply a per-drone RL action (0-12) to a specific drone.
     ///
-    /// Action space (19 actions):
+    /// Action space (13 actions):
     ///   0  = Attack nearest enemy target (direct)
     ///   1  = Attack farthest enemy target (direct)
     ///   2  = Attack least-defended enemy target (direct)
     ///   3  = Attack nearest enemy target (evasive)
     ///   4  = Attack farthest enemy target (evasive)
     ///   5  = Attack least-defended enemy target (evasive)
-    ///   6-11 = Attack target by index 0-5 (direct, wraps if fewer targets)
-    ///   12 = Intercept nearest enemy drone
-    ///   13 = Intercept 2nd nearest enemy drone
-    ///   14 = Intercept enemy cluster
-    ///   15 = Defend nearest friendly target (tight: 100m/300m)
-    ///   16 = Defend nearest friendly target (wide: 250m/600m)
-    ///   17 = Patrol perimeter
-    ///   18 = Evade nearest threat
+    ///   6  = Intercept nearest enemy drone
+    ///   7  = Intercept 2nd nearest enemy drone
+    ///   8  = Intercept enemy cluster
+    ///   9  = Defend nearest friendly target (tight: 100m/300m)
+    ///   10 = Defend nearest friendly target (wide: 250m/600m)
+    ///   11 = Patrol perimeter
+    ///   12 = Evade nearest threat
     fn apply_multi_rl_action(&mut self, drone_id: u32, action: u32) {
         // Record action for observation encoding.
         self.rl_last_actions.insert(drone_id, action);
@@ -1502,21 +1517,8 @@ impl Swarm {
                 }
             }
 
-            // --- Attack target by index 0-5 (direct, wraps) ---
-            6 | 7 | 8 | 9 | 10 | 11 => {
-                let idx = (action - 6) as usize;
-                let target_pos = self.enemy_target_by_index(drone_pos, other_group, idx);
-                if let Some(target) = target_pos {
-                    self.clear_drone_tasks_wasm(drone_id);
-                    if let Some(drone) = self.drones.iter_mut().find(|d| d.id == drone_id) {
-                        drone.agent.set_task(Box::new(AttackTask::new(target, DETONATION_RADIUS)));
-                    }
-                    self.attack_targets.insert(drone_id, target);
-                }
-            }
-
             // --- Intercept nearest enemy drone ---
-            12 => {
+            6 => {
                 let enemy_id = self.nth_nearest_enemy_drone_wasm(drone_pos, other_group, 0);
                 if let Some(eid) = enemy_id {
                     self.clear_drone_tasks_wasm(drone_id);
@@ -1529,7 +1531,7 @@ impl Swarm {
             }
 
             // --- Intercept 2nd nearest enemy drone ---
-            13 => {
+            7 => {
                 let enemy_id = self.nth_nearest_enemy_drone_wasm(drone_pos, other_group, 1);
                 if let Some(eid) = enemy_id {
                     self.clear_drone_tasks_wasm(drone_id);
@@ -1542,7 +1544,7 @@ impl Swarm {
             }
 
             // --- Intercept enemy cluster ---
-            14 => {
+            8 => {
                 self.clear_drone_tasks_wasm(drone_id);
                 if let Some(drone) = self.drones.iter_mut().find(|d| d.id == drone_id) {
                     drone.agent.set_task(Box::new(InterceptGroupTask::new(group, DETONATION_RADIUS)));
@@ -1550,7 +1552,7 @@ impl Swarm {
             }
 
             // --- Defend nearest friendly target (tight: 100m/300m) ---
-            15 => {
+            9 => {
                 let target_pos = self.nth_nearest_friendly_target(drone_pos, group, 0);
                 if let Some(center) = target_pos {
                     self.clear_drone_tasks_wasm(drone_id);
@@ -1563,7 +1565,7 @@ impl Swarm {
             }
 
             // --- Defend nearest friendly target (wide: 250m/600m) ---
-            16 => {
+            10 => {
                 let target_pos = self.nth_nearest_friendly_target(drone_pos, group, 0);
                 if let Some(center) = target_pos {
                     self.clear_drone_tasks_wasm(drone_id);
@@ -1576,7 +1578,7 @@ impl Swarm {
             }
 
             // --- Patrol perimeter ---
-            17 => {
+            11 => {
                 let friendly_positions: Vec<Position> = self.protected_zones
                     .get(&group)
                     .cloned()
@@ -1591,7 +1593,7 @@ impl Swarm {
             }
 
             // --- Evade nearest threat ---
-            18 => {
+            12 => {
                 self.clear_drone_tasks_wasm(drone_id);
                 if let Some(drone) = self.drones.iter_mut().find(|d| d.id == drone_id) {
                     drone.agent.set_task(Box::new(EvadeTask::new(group)));
@@ -1627,17 +1629,6 @@ impl Swarm {
             .copied()
     }
 
-    /// Get enemy target by index (sorted by distance, wraps if idx >= n_targets).
-    fn enemy_target_by_index(&self, drone_pos: Vec2, enemy_group: u32, idx: usize) -> Option<Position> {
-        let targets = self.protected_zones.get(&enemy_group)?;
-        if targets.is_empty() { return None; }
-        let mut sorted: Vec<(f32, Position)> = targets.iter()
-            .map(|p| (self.lib_bounds.distance(drone_pos, p.as_vec2()), *p))
-            .collect();
-        sorted.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-        let wrapped_idx = idx % sorted.len();
-        Some(sorted[wrapped_idx].1)
-    }
 
     /// Clear attack/intercept tracking for a drone.
     fn clear_drone_tasks_wasm(&mut self, drone_id: u32) {
@@ -2267,6 +2258,16 @@ pub fn load_rl_model_multi(
         initial_friendly_targets,
         initial_enemy_targets,
     ).map_err(|e| JsValue::from_str(&e))
+}
+
+#[wasm_bindgen]
+pub fn load_rl_normalizers(
+    handle: &mut SwarmHandle,
+    group: u32,
+    normalizer_json: &str,
+) -> Result<(), JsValue> {
+    handle.swarm.load_rl_normalizers(group, normalizer_json)
+        .map_err(|e| JsValue::from_str(&e))
 }
 
 #[wasm_bindgen]

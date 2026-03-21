@@ -45,16 +45,15 @@ pub fn check_win_condition(
 
     if a_eliminated && b_eliminated {
         GameResult::Draw
-    } else if b_eliminated {
+    } else if b_eliminated && !a_eliminated {
         GameResult::AWins
-    } else if a_eliminated {
+    } else if a_eliminated && !b_eliminated {
         GameResult::BWins
     } else {
-        // Both have effective targets but game ended (a side lost all drones).
-        // The side that still has drones wins. If neither has drones, draw.
-        if drones_a_alive > 0 && drones_b_alive == 0 {
+        // Both have effective targets. The side with more wins.
+        if eff_a > eff_b {
             GameResult::AWins
-        } else if drones_b_alive > 0 && drones_a_alive == 0 {
+        } else if eff_b > eff_a {
             GameResult::BWins
         } else {
             GameResult::Draw

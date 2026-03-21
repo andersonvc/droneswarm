@@ -40,7 +40,8 @@ pub use crate::game::state::TargetState as _TargetStateAlias;
 
 const DRONE_LENGTH_METERS: f32 = 37.5;
 const DETONATION_RADIUS: f32 = DRONE_LENGTH_METERS * 5.0; // 187.5m
-/// How often the RL agent makes decisions (in ticks).
+/// How often the single-agent RL makes decisions (in ticks).
+/// At dt=0.05 and speed_multiplier=8, this is 60*0.05*8 = 24 seconds of sim time.
 const DECISION_INTERVAL: u32 = 60;
 /// Patrol route standoff distance from target centroid.
 const PATROL_STANDOFF: f32 = 200.0;
@@ -53,6 +54,8 @@ const THREAT_RADIUS_MULTIPLIER: f32 = 5.0;
 
 pub use crate::game::obs_layout::{EGO_DIM, ENTITY_DIM, ACT_DIM, MAX_ENTITIES, MAX_VELOCITY, OBS_DIM, OBS_DIM_V2};
 /// How often the multi-agent RL makes decisions (in ticks).
+/// At dt=0.05 and speed_multiplier=2 (training), this is 20*0.05*2 = 2 seconds of sim time.
+/// Faster than doctrine (DECISION_INTERVAL=60) to allow reactive per-drone control.
 const MULTI_DECISION_INTERVAL: u32 = 20;
 
 // World layout fractions (derived from 10000m world proportions).
@@ -506,7 +509,25 @@ impl SimRunner {
         }
         let terminated = result != GameResult::InProgress;
 
-        let reward = self.compute_multi_reward(result);
+        let group_a_drones_ref: Vec<&GameDrone> = self.engine.drones.iter().filter(|d| d.group == 0).collect();
+        let reward = crate::game::reward::compute_multi_reward(
+            &crate::game::reward::RewardInput {
+                game_result: result,
+                snap_targets_a_alive: self.snap_targets_a_alive,
+                snap_targets_b_alive: self.snap_targets_b_alive,
+                snap_drones_a_alive: self.snap_drones_a_alive,
+                snap_drones_b_alive: self.snap_drones_b_alive,
+                current_targets_a_alive: self.engine.alive_targets_a(),
+                current_targets_b_alive: self.engine.alive_targets_b(),
+                current_drones_a_alive: self.engine.count_drones(0),
+                current_drones_b_alive: self.engine.count_drones(1),
+                detonation_radius: DETONATION_RADIUS,
+                tick_count: self.engine.tick_count,
+                max_ticks: self.config.max_ticks,
+            },
+            &group_a_drones_ref,
+            &self.engine.bounds,
+        );
         let (observations, drone_ids) = self.observe_multi();
 
         MultiStepResult {
@@ -523,6 +544,148 @@ impl SimRunner {
     pub fn reset_multi_with_seed(&mut self, seed: u64) -> (Vec<[f32; OBS_DIM]>, Vec<usize>) {
         self.reset_with_seed(seed);
         self.observe_multi()
+    }
+
+    /// RL vs Doctrine step: Group A is RL-controlled, Group B uses doctrine.
+    /// Returns V2 observations (Group A only) with individual rewards and death tracking.
+    /// Group B doctrine mode is set during reset (randomize_opponent flag).
+    pub fn step_rl_vs_doctrine_v2(
+        &mut self,
+        actions_a: &[(usize, u32)],
+    ) -> SelfPlayStepResult {
+        // Snapshot for reward computation.
+        self.snap_targets_a_alive = self.engine.alive_targets_a();
+        self.snap_targets_b_alive = self.engine.alive_targets_b();
+        self.snap_drones_a_alive = self.engine.count_drones(0);
+        self.snap_drones_b_alive = self.engine.count_drones(1);
+        self.snap_avg_enemy_dist = self.avg_min_enemy_target_dist(0);
+
+        let alive_ids_a_before: Vec<usize> = self.engine.drones.iter()
+            .filter(|d| d.group == 0)
+            .map(|d| d.id)
+            .collect();
+
+        self.per_drone_had_task.clear();
+        for drone in &self.engine.drones {
+            self.per_drone_had_task.insert(drone.id, drone.agent.task_info().is_some());
+        }
+
+        // Apply RL actions for Group A only.
+        for &(drone_id, action) in actions_a {
+            self.apply_rl_action(drone_id, action);
+        }
+
+        // Advance simulation — Group B uses doctrine.
+        let mut result = GameResult::InProgress;
+        let mut all_destroyed_ids: Vec<usize> = Vec::new();
+        let mut detonation_events: Vec<crate::game::reward::DetonationEvent> = Vec::new();
+
+        for _ in 0..MULTI_DECISION_INTERVAL {
+            // Snapshot target alive states BEFORE tick (tick marks targets as destroyed).
+            let targets_b_alive_before: Vec<bool> = self.engine.targets_b.iter().map(|t| !t.destroyed).collect();
+            let targets_a_alive_before: Vec<bool> = self.engine.targets_a.iter().map(|t| !t.destroyed).collect();
+
+            // Snapshot pending detonation drone positions before tick.
+            let pending_snapshot: Vec<(usize, Vec2)> = self.engine.pending_detonations.iter()
+                .filter_map(|&id| {
+                    self.engine.drones.iter().find(|d| d.id == id)
+                        .map(|d| (id, d.agent.state().pos.as_vec2()))
+                }).collect();
+
+            let tick_result = self.tick_with_mode(TickMode::RlVsDoctrine);
+            for &id in &tick_result.destroyed_ids {
+                all_destroyed_ids.push(id);
+            }
+
+            // Re-task idle Group A drones within the tick loop.
+            for &(drone_id, action) in actions_a {
+                if let Some(drone) = self.engine.drones.iter().find(|d| d.id == drone_id) {
+                    let is_idle = drone.agent.task_info().is_none();
+                    if is_idle {
+                        self.apply_rl_action(drone_id, action);
+                    }
+                }
+            }
+
+            // Match each blast_position to the nearest snapshotted detonating drone.
+            for blast_pos in &tick_result.blast_positions {
+                let blast_vec = blast_pos.as_vec2();
+                let detonator = pending_snapshot.iter()
+                    .min_by(|a, b| {
+                        let da = self.engine.bounds.distance(blast_vec, a.1);
+                        let db = self.engine.bounds.distance(blast_vec, b.1);
+                        da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                let Some(&(drone_id, _)) = detonator else { continue };
+                let group = if drone_id < self.engine.group_split_id { 0u32 } else { 1u32 };
+                let enemy_targets = if group == 0 { &self.engine.targets_b } else { &self.engine.targets_a };
+                let alive_before = if group == 0 { &targets_b_alive_before } else { &targets_a_alive_before };
+                let hit_target = enemy_targets.iter().zip(alive_before.iter()).any(|(t, &was_alive)| {
+                    was_alive && t.destroyed && self.engine.bounds.distance(blast_vec, t.pos.as_vec2()) <= self.engine.config.target_hit_radius
+                });
+                let hit_enemy_drone = tick_result.destroyed_ids.iter().any(|&eid| {
+                    if eid == drone_id { return false; }
+                    let eg = if eid < self.engine.group_split_id { 0u32 } else { 1u32 };
+                    eg != group
+                });
+                detonation_events.push(crate::game::reward::DetonationEvent {
+                    drone_id,
+                    group,
+                    blast_pos: blast_vec,
+                    hit_target,
+                    hit_enemy_drone,
+                });
+            }
+            result = tick_result.game_result;
+            if result != GameResult::InProgress { break; }
+        }
+
+        let truncated = result == GameResult::InProgress && self.engine.tick_count >= self.config.max_ticks;
+        if truncated { result = GameResult::Draw; }
+        let terminated = result != GameResult::InProgress;
+        let group_a_drones_ref: Vec<&GameDrone> = self.engine.drones.iter().filter(|d| d.group == 0).collect();
+        let reward = crate::game::reward::compute_multi_reward(
+            &crate::game::reward::RewardInput {
+                game_result: result,
+                snap_targets_a_alive: self.snap_targets_a_alive,
+                snap_targets_b_alive: self.snap_targets_b_alive,
+                snap_drones_a_alive: self.snap_drones_a_alive,
+                snap_drones_b_alive: self.snap_drones_b_alive,
+                current_targets_a_alive: self.engine.alive_targets_a(),
+                current_targets_b_alive: self.engine.alive_targets_b(),
+                current_drones_a_alive: self.engine.count_drones(0),
+                current_drones_b_alive: self.engine.count_drones(1),
+                detonation_radius: DETONATION_RADIUS,
+                tick_count: self.engine.tick_count,
+                max_ticks: self.config.max_ticks,
+            },
+            &group_a_drones_ref,
+            &self.engine.bounds,
+        );
+
+        let alive_ids_a_after: Vec<usize> = self.engine.drones.iter()
+            .filter(|d| d.group == 0).map(|d| d.id).collect();
+        let drone_deaths_a: Vec<usize> = alive_ids_a_before.iter()
+            .filter(|id| !alive_ids_a_after.contains(id)).copied().collect();
+
+        let dead_group_a: Vec<usize> = all_destroyed_ids.iter()
+            .filter(|&&id| id < self.engine.group_split_id).copied().collect();
+        let group_a_drones: Vec<&GameDrone> = self.engine.drones.iter()
+            .filter(|d| d.group == 0).collect();
+        let individual_rewards_a = crate::game::reward::compute_individual_rewards(
+            &detonation_events, &dead_group_a, &group_a_drones,
+            &self.engine.drones, &self.engine.targets_a,
+            DETONATION_RADIUS * THREAT_RADIUS_MULTIPLIER, &self.engine.bounds,
+        );
+
+        let (obs_a, drone_ids_a) = self.observe_multi_group_v2(0);
+        let (obs_b, drone_ids_b) = self.observe_multi_group_v2(1);
+
+        SelfPlayStepResult {
+            obs_a, drone_ids_a, obs_b, drone_ids_b,
+            reward, individual_rewards_a, terminated, truncated,
+            game_result: result, drone_deaths_a,
+        }
     }
 
     /// Self-play step: both groups controlled by RL policies.
@@ -568,6 +731,17 @@ impl SimRunner {
         let mut detonation_events: Vec<DetonationEvent> = Vec::new();
 
         for _ in 0..MULTI_DECISION_INTERVAL {
+            // Snapshot target alive states BEFORE tick (tick marks targets as destroyed).
+            let targets_b_alive_before: Vec<bool> = self.engine.targets_b.iter().map(|t| !t.destroyed).collect();
+            let targets_a_alive_before: Vec<bool> = self.engine.targets_a.iter().map(|t| !t.destroyed).collect();
+
+            // Snapshot pending detonation drone positions before tick.
+            let pending_snapshot: Vec<(usize, Vec2)> = self.engine.pending_detonations.iter()
+                .filter_map(|&id| {
+                    self.engine.drones.iter().find(|d| d.id == id)
+                        .map(|d| (id, d.agent.state().pos.as_vec2()))
+                }).collect();
+
             let tick_result = self.tick_with_mode(TickMode::SelfPlay);
 
             // Track destroyed drone IDs.
@@ -575,45 +749,54 @@ impl SimRunner {
                 all_destroyed_ids.push(id);
             }
 
-            // Build detonation events from blast positions.
-            // Each destroyed drone that was in pending_detonations is a detonation.
-            for &destroyed_id in &tick_result.destroyed_ids {
-                // Determine the group of the destroyed drone.
-                let group = if destroyed_id < self.engine.group_split_id { 0u32 } else { 1u32 };
-
-                // Check if this drone's blast hit any targets or enemies.
-                // Use blast_positions proximity to determine hits.
-                for blast_pos in &tick_result.blast_positions {
-                    let blast_vec = blast_pos.as_vec2();
-
-                    // Check if blast hit any enemy target.
-                    let enemy_targets = if group == 0 {
-                        &self.engine.targets_b
-                    } else {
-                        &self.engine.targets_a
-                    };
-                    let hit_target = enemy_targets.iter().any(|t| {
-                        self.engine.bounds.distance(blast_vec, t.pos.as_vec2()) <= DETONATION_RADIUS
-                    });
-
-                    // Check if blast hit any enemy drone (that was also destroyed).
-                    let hit_enemy_drone = tick_result.destroyed_ids.iter().any(|&eid| {
-                        if eid == destroyed_id {
-                            return false;
-                        }
-                        let enemy_group = if eid < self.engine.group_split_id { 0u32 } else { 1u32 };
-                        enemy_group != group
-                    });
-
-                    detonation_events.push(DetonationEvent {
-                        drone_id: destroyed_id,
-                        group,
-                        blast_pos: blast_vec,
-                        hit_target,
-                        hit_enemy_drone,
-                    });
-                    break; // One event per destroyed drone is enough.
+            // Re-task idle drones within the tick loop (both groups in self-play).
+            for &(drone_id, action) in actions_a {
+                if let Some(drone) = self.engine.drones.iter().find(|d| d.id == drone_id) {
+                    if drone.agent.task_info().is_none() {
+                        self.apply_rl_action(drone_id, action);
+                    }
                 }
+            }
+            for &(drone_id, action) in actions_b {
+                if let Some(drone) = self.engine.drones.iter().find(|d| d.id == drone_id) {
+                    if drone.agent.task_info().is_none() {
+                        self.apply_rl_action(drone_id, action);
+                    }
+                }
+            }
+
+            // Match each blast_position to the nearest snapshotted detonating drone.
+            for blast_pos in &tick_result.blast_positions {
+                let blast_vec = blast_pos.as_vec2();
+                let detonator = pending_snapshot.iter()
+                    .min_by(|a, b| {
+                        let da = self.engine.bounds.distance(blast_vec, a.1);
+                        let db = self.engine.bounds.distance(blast_vec, b.1);
+                        da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                let Some(&(drone_id, _)) = detonator else { continue };
+                let group = if drone_id < self.engine.group_split_id { 0u32 } else { 1u32 };
+                let enemy_targets = if group == 0 {
+                    &self.engine.targets_b
+                } else {
+                    &self.engine.targets_a
+                };
+                let alive_before = if group == 0 { &targets_b_alive_before } else { &targets_a_alive_before };
+                let hit_target = enemy_targets.iter().zip(alive_before.iter()).any(|(t, &was_alive)| {
+                    was_alive && t.destroyed && self.engine.bounds.distance(blast_vec, t.pos.as_vec2()) <= self.engine.config.target_hit_radius
+                });
+                let hit_enemy_drone = tick_result.destroyed_ids.iter().any(|&eid| {
+                    if eid == drone_id { return false; }
+                    let enemy_group = if eid < self.engine.group_split_id { 0u32 } else { 1u32 };
+                    enemy_group != group
+                });
+                detonation_events.push(DetonationEvent {
+                    drone_id,
+                    group,
+                    blast_pos: blast_vec,
+                    hit_target,
+                    hit_enemy_drone,
+                });
             }
 
             result = tick_result.game_result;
@@ -628,7 +811,25 @@ impl SimRunner {
         }
         let terminated = result != GameResult::InProgress;
 
-        let reward = self.compute_multi_reward(result);
+        let group_a_drones_ref: Vec<&GameDrone> = self.engine.drones.iter().filter(|d| d.group == 0).collect();
+        let reward = crate::game::reward::compute_multi_reward(
+            &crate::game::reward::RewardInput {
+                game_result: result,
+                snap_targets_a_alive: self.snap_targets_a_alive,
+                snap_targets_b_alive: self.snap_targets_b_alive,
+                snap_drones_a_alive: self.snap_drones_a_alive,
+                snap_drones_b_alive: self.snap_drones_b_alive,
+                current_targets_a_alive: self.engine.alive_targets_a(),
+                current_targets_b_alive: self.engine.alive_targets_b(),
+                current_drones_a_alive: self.engine.count_drones(0),
+                current_drones_b_alive: self.engine.count_drones(1),
+                detonation_radius: DETONATION_RADIUS,
+                tick_count: self.engine.tick_count,
+                max_ticks: self.config.max_ticks,
+            },
+            &group_a_drones_ref,
+            &self.engine.bounds,
+        );
 
         // Determine which Group A drones died during this step.
         let alive_ids_a_after: Vec<usize> = self.engine.drones.iter()
@@ -705,6 +906,8 @@ impl SimRunner {
             &self.engine.targets_a,
             &self.engine.targets_b,
             &self.last_actions,
+            &self.engine.attack_targets,
+            &self.engine.intercept_targets,
             self.engine.tick_count,
             &self.engine.bounds,
             &config,
@@ -928,6 +1131,19 @@ impl SimRunner {
     ///   17 = Patrol perimeter
     ///   18 = Evade nearest threat
     fn apply_rl_action(&mut self, drone_id: usize, action: u32) {
+        // Skip re-assignment if same action repeated and drone has active task.
+        // This prevents interrupting ongoing attack/intercept tasks that require
+        // sustained execution over multiple decision steps.
+        if let Some(&prev_action) = self.last_actions.get(&drone_id) {
+            if prev_action == action {
+                if let Some(drone) = self.engine.drones.iter().find(|d| d.id == drone_id) {
+                    if drone.agent.task_info().is_some() {
+                        return; // Same action, task still active — keep going
+                    }
+                }
+            }
+        }
+
         // Record action for observation encoding.
         self.last_actions.insert(drone_id, action);
 
@@ -1010,21 +1226,8 @@ impl SimRunner {
                 }
             }
 
-            // --- Attack target by index 0-5 (direct, wraps) ---
-            6 | 7 | 8 | 9 | 10 | 11 => {
-                let idx = (action - 6) as usize;
-                let target_pos = self.enemy_target_by_index(group, idx);
-                if let Some(target) = target_pos {
-                    self.clear_drone_tasks(drone_id);
-                    if let Some(drone) = self.engine.drones.iter_mut().find(|d| d.id == drone_id) {
-                        drone.agent.set_task(Box::new(AttackTask::new(target, DETONATION_RADIUS)));
-                    }
-                    self.engine.attack_targets.insert(drone_id, target);
-                }
-            }
-
             // --- Intercept nearest enemy drone ---
-            12 => {
+            6 => {
                 let enemy_id = self.nth_nearest_enemy_drone(drone_pos, group, 0);
                 if let Some(eid) = enemy_id {
                     self.clear_drone_tasks(drone_id);
@@ -1033,7 +1236,7 @@ impl SimRunner {
             }
 
             // --- Intercept 2nd nearest enemy drone ---
-            13 => {
+            7 => {
                 let enemy_id = self.nth_nearest_enemy_drone(drone_pos, group, 1);
                 if let Some(eid) = enemy_id {
                     self.clear_drone_tasks(drone_id);
@@ -1042,7 +1245,7 @@ impl SimRunner {
             }
 
             // --- Intercept enemy cluster ---
-            14 => {
+            8 => {
                 self.clear_drone_tasks(drone_id);
                 if let Some(drone) = self.engine.drones.iter_mut().find(|d| d.id == drone_id) {
                     drone.agent.set_task(Box::new(InterceptGroupTask::new(group, DETONATION_RADIUS)));
@@ -1050,7 +1253,7 @@ impl SimRunner {
             }
 
             // --- Defend nearest friendly target (tight: 100m orbit, 300m engage) ---
-            15 => {
+            9 => {
                 let target_pos = self.nth_nearest_friendly_target(drone_pos, group, 0);
                 if let Some(center) = target_pos {
                     self.clear_drone_tasks(drone_id);
@@ -1063,7 +1266,7 @@ impl SimRunner {
             }
 
             // --- Defend nearest friendly target (wide: 250m orbit, 600m engage) ---
-            16 => {
+            10 => {
                 let target_pos = self.nth_nearest_friendly_target(drone_pos, group, 0);
                 if let Some(center) = target_pos {
                     self.clear_drone_tasks(drone_id);
@@ -1076,7 +1279,7 @@ impl SimRunner {
             }
 
             // --- Patrol perimeter ---
-            17 => {
+            11 => {
                 let friendly_targets = if group == 0 { &self.engine.targets_a } else { &self.engine.targets_b };
                 let friendly_positions: Vec<Position> = friendly_targets.iter()
                     .filter(|t| !t.destroyed)
@@ -1092,7 +1295,7 @@ impl SimRunner {
             }
 
             // --- Evade nearest threat ---
-            18 => {
+            12 => {
                 self.clear_drone_tasks(drone_id);
                 if let Some(drone) = self.engine.drones.iter_mut().find(|d| d.id == drone_id) {
                     drone.agent.set_task(Box::new(EvadeTask::new(group)));
@@ -1166,19 +1369,6 @@ impl SimRunner {
         });
 
         target_attacker_counts.first().map(|(pos, _, _)| *pos)
-    }
-
-    /// Get an enemy target by index (wraps if index exceeds target count).
-    fn enemy_target_by_index(&self, group: u32, idx: usize) -> Option<Position> {
-        let enemy_targets = if group == 0 { &self.engine.targets_b } else { &self.engine.targets_a };
-        let alive: Vec<Position> = enemy_targets.iter()
-            .filter(|t| !t.destroyed)
-            .map(|t| t.pos)
-            .collect();
-        if alive.is_empty() {
-            return None;
-        }
-        Some(alive[idx % alive.len()])
     }
 
     /// Get the Nth nearest alive friendly target position (0-indexed, group-aware).
@@ -1260,66 +1450,6 @@ impl SimRunner {
         for assignment in assignments {
             self.apply_task_assignment(assignment);
         }
-    }
-
-    /// Compute reward for multi-agent step (shared team reward, Group A perspective).
-    fn compute_multi_reward(&self, result: GameResult) -> f32 {
-        let mut reward = 0.0;
-
-        // Terminal reward.
-        match result {
-            GameResult::AWins => reward += 10.0,
-            GameResult::BWins => reward -= 10.0,
-            GameResult::Draw => reward -= 5.0,
-            GameResult::InProgress => {}
-        }
-
-        // Potential-based reward shaping using advantage ratios.
-        const W_TARGETS: f32 = 5.0;
-        const W_DRONES: f32 = 1.0;
-
-        let phi_before =
-            W_TARGETS * (self.snap_targets_a_alive as f32 / (1.0 + self.snap_targets_b_alive as f32))
-            + W_DRONES * (self.snap_drones_a_alive as f32 / (1.0 + self.snap_drones_b_alive as f32));
-
-        let phi_after =
-            W_TARGETS * (self.engine.alive_targets_a() as f32 / (1.0 + self.engine.alive_targets_b() as f32))
-            + W_DRONES * (self.engine.count_drones(0) as f32 / (1.0 + self.engine.count_drones(1) as f32));
-
-        reward += phi_after - phi_before;
-
-        // Approach reward: reward drones for moving closer to enemy targets.
-        let current_avg_dist = self.avg_min_enemy_target_dist(0);
-        let world_diag = (self.config.world_size * self.config.world_size * 2.0).sqrt();
-        if world_diag > 0.0 {
-            let dist_delta = (self.snap_avg_enemy_dist - current_avg_dist) / world_diag;
-            reward += 2.0 * dist_delta; // positive when drones moved closer
-        }
-
-        // Time pressure: step penalty ramps up as the game progresses.
-        // Early game (~0%): -0.001/step. Late game (~100%): -0.01/step.
-        // Quadratic ramp so agents feel increasing urgency to finish.
-        let time_frac = self.engine.tick_count as f32 / self.config.max_ticks as f32;
-        let step_penalty = 0.001 + 0.009 * time_frac * time_frac;
-        reward -= step_penalty;
-
-        // Cluster density penalty.
-        let group_a_drones: Vec<_> = self.engine.drones.iter()
-            .filter(|d| d.group == 0)
-            .collect();
-        let mut cluster_penalty = 0.0f32;
-        for drone in &group_a_drones {
-            let pos = drone.agent.state().pos.as_vec2();
-            let nearby = group_a_drones.iter()
-                .filter(|d| d.id != drone.id
-                    && self.engine.bounds.distance(pos, d.agent.state().pos.as_vec2()) <= DETONATION_RADIUS)
-                .count() as f32;
-            cluster_penalty += (nearby - 2.0).max(0.0);
-        }
-        let n_drones = group_a_drones.len().max(1) as f32;
-        reward -= 0.01 * cluster_penalty / n_drones;
-
-        reward
     }
 
     /// Current game result.

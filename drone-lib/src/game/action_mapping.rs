@@ -1,16 +1,15 @@
-//! RL action mapping for per-drone discrete actions (V2, 19 actions).
+//! RL action mapping for per-drone discrete actions (V2, 13 actions).
 //!
-//! Translates action indices (0-18) into task assignments.
+//! Translates action indices (0-12) into task assignments.
 //!
 //! Action space:
 //!   0-2:   Attack {nearest, farthest, least-defended} enemy target (direct)
 //!   3-5:   Attack {nearest, farthest, least-defended} enemy target (evasive)
-//!   6-11:  Attack target by index 0-5 (direct, wraps if fewer targets)
-//!   12-13: Intercept {nearest, 2nd nearest} enemy drone
-//!   14:    Intercept enemy cluster
-//!   15-16: Defend nearest friendly target {tight 100m/300m, wide 250m/600m}
-//!   17:    Patrol perimeter
-//!   18:    Evade nearest threat
+//!   6-7:   Intercept {nearest, 2nd nearest} enemy drone
+//!   8:     Intercept enemy cluster
+//!   9-10:  Defend nearest friendly target {tight 100m/300m, wide 250m/600m}
+//!   11:    Patrol perimeter
+//!   12:    Evade nearest threat
 
 use std::collections::HashMap;
 
@@ -25,7 +24,7 @@ use crate::types::{Bounds, Position, Vec2};
 use super::patrol::build_patrol_route;
 use super::state::{GameDrone, TargetState};
 
-/// Apply an RL action (0-18) to a drone in the game engine.
+/// Apply an RL action (0-12) to a drone in the game engine.
 pub fn apply_rl_action(
     drone_id: usize,
     action: u32,
@@ -109,18 +108,8 @@ pub fn apply_rl_action(
                 set_attack_evasive(drone_id, target, drones, attack_targets, detonation_radius);
             }
         }
-        // --- Attack target by index 0-5 (direct, wraps if fewer targets) ---
-        6..=11 => {
-            let idx = (action - 6) as usize;
-            if let Some(target) =
-                enemy_target_by_index(drone_pos, group, idx, targets_a, targets_b, bounds)
-            {
-                clear_tasks(drone_id, attack_targets, intercept_targets);
-                set_attack_direct(drone_id, target, drones, attack_targets, detonation_radius);
-            }
-        }
         // --- Intercept nearest enemy drone ---
-        12 => {
+        6 => {
             if let Some(eid) = nth_nearest_enemy_drone(drone_pos, group, 0, drones, bounds) {
                 clear_tasks(drone_id, attack_targets, intercept_targets);
                 intercept_drone_task(
@@ -134,7 +123,7 @@ pub fn apply_rl_action(
             }
         }
         // --- Intercept 2nd nearest enemy drone ---
-        13 => {
+        7 => {
             if let Some(eid) = nth_nearest_enemy_drone(drone_pos, group, 1, drones, bounds) {
                 clear_tasks(drone_id, attack_targets, intercept_targets);
                 intercept_drone_task(
@@ -148,7 +137,7 @@ pub fn apply_rl_action(
             }
         }
         // --- Intercept enemy cluster ---
-        14 => {
+        8 => {
             clear_tasks(drone_id, attack_targets, intercept_targets);
             if let Some(drone) = drones.iter_mut().find(|d| d.id == drone_id) {
                 drone
@@ -157,7 +146,7 @@ pub fn apply_rl_action(
             }
         }
         // --- Defend nearest friendly target (tight: 100m orbit, 300m engage) ---
-        15 => {
+        9 => {
             let target_pos =
                 nth_nearest_friendly_target(drone_pos, group, 0, targets_a, targets_b, bounds);
             if let Some(center) = target_pos {
@@ -175,7 +164,7 @@ pub fn apply_rl_action(
             }
         }
         // --- Defend nearest friendly target (wide: 250m orbit, 600m engage) ---
-        16 => {
+        10 => {
             let target_pos =
                 nth_nearest_friendly_target(drone_pos, group, 0, targets_a, targets_b, bounds);
             if let Some(center) = target_pos {
@@ -193,7 +182,7 @@ pub fn apply_rl_action(
             }
         }
         // --- Patrol perimeter ---
-        17 => {
+        11 => {
             let friendly_targets = if group == 0 { targets_a } else { targets_b };
             let friendly_positions: Vec<Position> = friendly_targets
                 .iter()
@@ -211,7 +200,7 @@ pub fn apply_rl_action(
             }
         }
         // --- Evade nearest threat ---
-        18 => {
+        12 => {
             clear_tasks(drone_id, attack_targets, intercept_targets);
             if let Some(drone) = drones.iter_mut().find(|d| d.id == drone_id) {
                 drone.agent.set_task(Box::new(EvadeTask::new(group)));
@@ -347,29 +336,6 @@ fn least_defended_enemy_target(
     }
 
     Some(best_target)
-}
-
-/// Get enemy target by index (sorted by distance), wrapping if fewer targets.
-fn enemy_target_by_index(
-    drone_pos: Vec2,
-    group: u32,
-    idx: usize,
-    targets_a: &[TargetState],
-    targets_b: &[TargetState],
-    bounds: &Bounds,
-) -> Option<Position> {
-    let enemy_targets = if group == 0 { targets_b } else { targets_a };
-    let mut targets: Vec<(f32, Position)> = enemy_targets
-        .iter()
-        .filter(|t| !t.destroyed)
-        .map(|t| (bounds.distance(drone_pos, t.pos.as_vec2()), t.pos))
-        .collect();
-    if targets.is_empty() {
-        return None;
-    }
-    targets.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-    let wrapped_idx = idx % targets.len();
-    Some(targets[wrapped_idx].1)
 }
 
 /// Get the Nth nearest alive friendly target position (0-indexed, group-aware).

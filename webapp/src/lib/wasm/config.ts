@@ -38,7 +38,7 @@ const DEFAULT_CONFIG: SimulationConfig = {
     droneCount: DEFAULT_DRONE_COUNT,
     spawnPattern: { custom: { positions: generateTwoClusterPositions(DEFAULT_DRONE_COUNT, CLUSTER_A, CLUSTER_B) } },
     bounds: { width: 4000, height: 4000 },
-    speedMultiplier: 8.0,
+    speedMultiplier: 16.0,
     worldWidthMeters: 10000,
     worldHeightMeters: 10000,
 };

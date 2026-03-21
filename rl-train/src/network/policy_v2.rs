@@ -2,21 +2,26 @@
 //!
 //! Replaces the flat MLP with:
 //! 1. Separate ego and entity encoders
-//! 2. Multi-head self-attention over entity embeddings
-//! 3. Mean pooling of attended entities
+//! 2. 2-layer multi-head self-attention over entity embeddings
+//! 3. Max pooling of attended entities
 //! 4. Trunk MLP with actor and local-value heads
 
 use rand::Rng;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use drone_lib::game::action_mask::{compute_action_mask, apply_mask_to_logits};
 use crate::network::layer::{DenseLayer, matmul_bias_relu};
 use crate::network::attention::MultiHeadAttention;
 
-/// Softmax over a slice.
+/// Softmax over a slice with NaN/zero-sum guard.
 fn softmax(logits: &[f32]) -> Vec<f32> {
     let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     let exp: Vec<f32> = logits.iter().map(|&x| (x - max).exp()).collect();
     let sum: f32 = exp.iter().sum();
+    if sum == 0.0 || sum.is_nan() {
+        let uniform = 1.0 / logits.len() as f32;
+        return vec![uniform; logits.len()];
+    }
     exp.iter().map(|&e| e / sum).collect()
 }
 
@@ -25,19 +30,29 @@ fn softmax(logits: &[f32]) -> Vec<f32> {
 /// Architecture:
 ///   ego -> ego_encoder -> ego_embed [embed_dim]
 ///   entities -> entity_encoder -> entity_embeds [n_entities, embed_dim]
-///   entity_embeds -> attn -> attn_out [n_entities, embed_dim]
-///   attn_out -> mean_pool -> pooled [embed_dim]
+///   entity_embeds -> attn -> attn2 -> attn_out [n_entities, embed_dim]
+///   attn_out -> max_pool -> pooled [embed_dim]
 ///   concat(ego_embed, pooled) -> fc1 -> fc2 -> actor_head / local_value_head
 #[derive(Clone, Serialize, Deserialize)]
 pub struct PolicyNetV2 {
     pub ego_encoder: DenseLayer,      // EGO_DIM -> embed_dim, ReLU
     pub entity_encoder: DenseLayer,   // ENTITY_DIM -> embed_dim, ReLU
     pub attn: MultiHeadAttention,     // embed_dim -> embed_dim, n_heads
+    pub attn2: MultiHeadAttention,    // embed_dim -> embed_dim, n_heads (2nd layer)
     pub fc1: DenseLayer,              // 2*embed_dim -> hidden, ReLU
     pub fc2: DenseLayer,              // hidden -> hidden, ReLU
     pub actor_head: DenseLayer,       // hidden -> ACT_DIM, linear
     pub local_value_head: DenseLayer, // hidden -> 1, linear
     pub embed_dim: usize,
+
+    // Per-entity caches to fix DenseLayer cache corruption in entity_encoder.
+    // entity_encoder has relu=true, so we must cache both last_input and last_pre_activation.
+    #[serde(skip)]
+    entity_inputs_cache: Vec<Vec<f32>>,
+    #[serde(skip)]
+    entity_pre_acts_cache: Vec<Vec<f32>>,
+    #[serde(skip)]
+    cache_max_indices: Vec<usize>,  // [embed_dim] which entity was max for each dim
 }
 
 impl PolicyNetV2 {
@@ -61,11 +76,15 @@ impl PolicyNetV2 {
             ego_encoder: DenseLayer::new(ego_dim, embed_dim, true, rng),         // gain=sqrt(2) for ReLU
             entity_encoder: DenseLayer::new(entity_dim, embed_dim, true, rng),   // gain=sqrt(2) for ReLU
             attn: MultiHeadAttention::new(embed_dim, 4, rng),                    // 4 heads
+            attn2: MultiHeadAttention::new(embed_dim, 4, rng),                   // 4 heads (2nd layer)
             fc1: DenseLayer::new(2 * embed_dim, hidden, true, rng),              // gain=sqrt(2) for ReLU
             fc2: DenseLayer::new(hidden, hidden, true, rng),                     // gain=sqrt(2) for ReLU
             actor_head: DenseLayer::new_with_gain(hidden, act_dim, false, 0.01, rng), // small gain -> near-uniform
             local_value_head: DenseLayer::new_with_gain(hidden, 1, false, 1.0, rng),  // gain=1.0
             embed_dim,
+            entity_inputs_cache: Vec::new(),
+            entity_pre_acts_cache: Vec::new(),
+            cache_max_indices: Vec::new(),
         }
     }
 
@@ -84,30 +103,40 @@ impl PolicyNetV2 {
         let ego_embed = self.ego_encoder.forward(ego);
 
         // 2. Encode each entity.
+        // Cache per-entity inputs and pre-activations for correct backward.
         let mut entity_embeds = Vec::with_capacity(n_entities * e);
+        self.entity_inputs_cache.clear();
+        self.entity_pre_acts_cache.clear();
         for i in 0..n_entities {
             let ent_slice = &entities[i * entity_dim..(i + 1) * entity_dim];
             entity_embeds.extend_from_slice(&self.entity_encoder.forward(ent_slice));
+            self.entity_inputs_cache.push(self.entity_encoder.last_input.clone());
+            self.entity_pre_acts_cache.push(self.entity_encoder.last_pre_activation.clone());
         }
 
-        // 3. Self-attention over entity embeddings.
+        // 3. Self-attention over entity embeddings (2 stacked layers).
         let attn_out = if n_entities > 0 {
-            self.attn.forward(&entity_embeds, n_entities)
+            let attn_out1 = self.attn.forward(&entity_embeds, n_entities);
+            self.attn2.forward(&attn_out1, n_entities)
         } else {
             Vec::new()
         };
 
-        // 4. Mean pool attended entities.
+        // 4. Max pool attended entities.
         let pooled = if n_entities > 0 {
-            let mut pool = vec![0.0f32; e];
-            let inv_n = 1.0 / n_entities as f32;
+            let mut pool = vec![f32::NEG_INFINITY; e];
+            self.cache_max_indices = vec![0; e];
             for i in 0..n_entities {
                 for j in 0..e {
-                    pool[j] += attn_out[i * e + j] * inv_n;
+                    if attn_out[i * e + j] > pool[j] {
+                        pool[j] = attn_out[i * e + j];
+                        self.cache_max_indices[j] = i;
+                    }
                 }
             }
             pool
         } else {
+            self.cache_max_indices = vec![0; e];
             vec![0.0f32; e]
         };
 
@@ -127,15 +156,23 @@ impl PolicyNetV2 {
         (logits, value[0], h2)
     }
 
-    /// Sample action from policy. Returns (action, log_prob, value).
-    pub fn act(&mut self, ego: &[f32], entities: &[f32], n_entities: usize, rng: &mut impl Rng) -> (u32, f32, f32) {
-        let (logits, value, _h2) = self.forward(ego, entities, n_entities);
+    /// Sample action from policy with action masking. Returns (action, log_prob, value).
+    /// `raw_entities` should be unnormalized for correct mask computation.
+    pub fn act(&mut self, ego: &[f32], entities: &[f32], n_entities: usize, raw_entities: Option<&[f32]>, rng: &mut impl Rng) -> (u32, f32, f32) {
+        let (mut logits, value, _h2) = self.forward(ego, entities, n_entities);
+
+        // Apply action mask using raw entities (type_flags are not normalized).
+        if let Some(raw) = raw_entities {
+            let mask = compute_action_mask(raw, n_entities);
+            apply_mask_to_logits(&mut logits, &mask);
+        }
+
         let probs = softmax(&logits);
 
         // Sample from categorical.
         let u: f32 = rng.gen();
         let mut cum = 0.0;
-        let mut action = 0u32;
+        let mut action = (probs.len() - 1) as u32;
         for (i, &p) in probs.iter().enumerate() {
             cum += p;
             if u <= cum {
@@ -148,12 +185,7 @@ impl PolicyNetV2 {
         (action, log_prob, value)
     }
 
-    /// Batched inference with partial batching optimization.
-    ///
-    /// Batches ego encoding and entity encoding via single matmul calls,
-    /// runs per-sample attention (variable-length), then batches the trunk.
-    ///
-    /// Returns one (action, log_prob, value) per sample.
+    /// Batched inference. Returns one (action, log_prob, value) per sample.
     pub fn act_batch(
         &self,
         egos: &[&[f32]],
@@ -161,19 +193,31 @@ impl PolicyNetV2 {
         n_entities_list: &[usize],
         rng: &mut impl Rng,
     ) -> Vec<(u32, f32, f32)> {
-        let (results, _h2) = self.act_batch_with_h2(egos, entities_list, n_entities_list, rng);
+        // No raw entities needed for mask — use act_batch_with_h2_masked with empty raw.
+        let (results, _h2) = self.act_batch_with_h2_masked(egos, entities_list, n_entities_list, None, rng);
         results
     }
 
     /// Like act_batch but also returns h2 hidden representations (flat).
-    ///
-    /// Returns (actions_results, h2_flat) where h2_flat is [batch_size * hidden_dim].
-    /// Used by MAPPO centralized critic and QMIX mixer during rollout collection.
+    /// `raw_entities_list` is used for action masking (unnormalized entity data).
+    /// If None, no action masking is applied.
     pub fn act_batch_with_h2(
         &self,
         egos: &[&[f32]],
         entities_list: &[&[f32]],
         n_entities_list: &[usize],
+        rng: &mut impl Rng,
+    ) -> (Vec<(u32, f32, f32)>, Vec<f32>) {
+        self.act_batch_with_h2_masked(egos, entities_list, n_entities_list, None, rng)
+    }
+
+    /// Batched forward + action sampling with optional raw entities for masking.
+    pub fn act_batch_with_h2_masked(
+        &self,
+        egos: &[&[f32]],
+        entities_list: &[&[f32]],
+        n_entities_list: &[usize],
+        raw_entities_list: Option<&[&[f32]]>,
         rng: &mut impl Rng,
     ) -> (Vec<(u32, f32, f32)>, Vec<f32>) {
         let batch_size = egos.len();
@@ -229,10 +273,15 @@ impl PolicyNetV2 {
                     let pooled = if n_ent > 0 {
                         let ent_embeds = &all_ent_embeds[ent_off * e..(ent_off + n_ent) * e];
                         let mut attn_clone = self.attn.clone();
-                        let attn_out = attn_clone.forward(ent_embeds, n_ent);
-                        let inv_n = 1.0 / n_ent as f32;
-                        let mut pool = vec![0.0f32; e];
-                        for j in 0..n_ent { for k in 0..e { pool[k] += attn_out[j * e + k] * inv_n; } }
+                        let mut attn2_clone = self.attn2.clone();
+                        let attn_out1 = attn_clone.forward(ent_embeds, n_ent);
+                        let attn_out = attn2_clone.forward(&attn_out1, n_ent);
+                        let mut pool = vec![f32::NEG_INFINITY; e];
+                        for i in 0..n_ent {
+                            for j in 0..e {
+                                pool[j] = pool[j].max(attn_out[i * e + j]);
+                            }
+                        }
                         pool
                     } else { vec![0.0f32; e] };
                     trunk_inputs.extend_from_slice(ego_embed);
@@ -259,14 +308,19 @@ impl PolicyNetV2 {
             h2_flat.extend_from_slice(h);
         }
 
-        // --- Sequential action sampling ---
+        // --- Sequential action sampling with masking ---
         let mut results = Vec::with_capacity(batch_size);
         for i in 0..batch_size {
-            let logit_slice = &logits_flat[i * act_dim..(i + 1) * act_dim];
-            let probs = softmax(logit_slice);
+            let mut logits = logits_flat[i * act_dim..(i + 1) * act_dim].to_vec();
+            // Apply action mask using RAW (unnormalized) entities so type_flags are intact.
+            if let Some(raw_ents) = raw_entities_list {
+                let mask = compute_action_mask(raw_ents[i], n_entities_list[i]);
+                apply_mask_to_logits(&mut logits, &mask);
+            }
+            let probs = softmax(&logits);
             let u: f32 = rng.gen();
             let mut cum = 0.0;
-            let mut action = 0u32;
+            let mut action = (probs.len() - 1) as u32;
             for (j, &p) in probs.iter().enumerate() {
                 cum += p;
                 if u <= cum { action = j as u32; break; }
@@ -312,26 +366,28 @@ impl PolicyNetV2 {
         let grad_ego_embed = &grad_trunk[..e];
         let grad_pooled = &grad_trunk[e..2 * e];
 
-        // Backward through mean pool: distribute 1/n_entities to each entity.
+        // Max pool backward: gradient flows only to the entity that was the max for each dim.
         let grad_ego = self.ego_encoder.backward(grad_ego_embed);
 
         let mut grad_entities = Vec::new();
         if n_entities > 0 {
-            let inv_n = 1.0 / n_entities as f32;
             let mut grad_attn_out = vec![0.0f32; n_entities * e];
-            for i in 0..n_entities {
-                for j in 0..e {
-                    grad_attn_out[i * e + j] = grad_pooled[j] * inv_n;
-                }
+            for j in 0..e {
+                let max_ent = self.cache_max_indices[j];
+                grad_attn_out[max_ent * e + j] = grad_pooled[j];
             }
 
-            // Backward through attention.
-            let grad_entity_embeds = self.attn.backward(&grad_attn_out, n_entities);
+            // Backward through attention (attn2 first, then attn).
+            let grad_attn_out1 = self.attn2.backward(&grad_attn_out, n_entities);
+            let grad_entity_embeds = self.attn.backward(&grad_attn_out1, n_entities);
 
             // Backward through entity encoder (per entity, reverse order).
+            // Restore per-entity cached input and pre-activation before each backward call.
             let entity_dim = self.entity_encoder.in_dim;
             grad_entities = vec![0.0f32; n_entities * entity_dim];
             for i in (0..n_entities).rev() {
+                self.entity_encoder.last_input = self.entity_inputs_cache[i].clone();
+                self.entity_encoder.last_pre_activation = self.entity_pre_acts_cache[i].clone();
                 let g_slice = &grad_entity_embeds[i * e..(i + 1) * e];
                 let d_in = self.entity_encoder.backward(g_slice);
                 grad_entities[i * entity_dim..(i + 1) * entity_dim].copy_from_slice(&d_in);
@@ -356,6 +412,7 @@ impl PolicyNetV2 {
             }
         }
         sum_sq += self.attn.grad_norm_sq();
+        sum_sq += self.attn2.grad_norm_sq();
         sum_sq.sqrt()
     }
 
@@ -376,6 +433,7 @@ impl PolicyNetV2 {
                 }
             }
             self.attn.scale_grads(scale);
+            self.attn2.scale_grads(scale);
         }
         norm
     }
@@ -384,11 +442,13 @@ impl PolicyNetV2 {
     pub fn adam_step(&mut self, lr: f32, batch_size: usize, beta1: f32, beta2: f32, epsilon: f32, weight_decay: f32, t: usize) {
         self.ego_encoder.adam_step(lr, batch_size, beta1, beta2, epsilon, weight_decay, t);
         self.entity_encoder.adam_step(lr, batch_size, beta1, beta2, epsilon, weight_decay, t);
-        self.attn.adam_step(lr, batch_size, beta1, beta2, epsilon, weight_decay, t);
+        // No weight decay for attention projections — prevents shrinking Q/K dot products.
+        self.attn.adam_step(lr, batch_size, beta1, beta2, epsilon, 0.0, t);
+        self.attn2.adam_step(lr, batch_size, beta1, beta2, epsilon, 0.0, t);
         self.fc1.adam_step(lr, batch_size, beta1, beta2, epsilon, weight_decay, t);
         self.fc2.adam_step(lr, batch_size, beta1, beta2, epsilon, weight_decay, t);
-        self.actor_head.adam_step(lr, batch_size, beta1, beta2, epsilon, weight_decay, t);
-        self.local_value_head.adam_step(lr, batch_size, beta1, beta2, epsilon, weight_decay, t);
+        self.actor_head.adam_step(lr, batch_size, beta1, beta2, epsilon, 0.0, t);
+        self.local_value_head.adam_step(lr, batch_size, beta1, beta2, epsilon, 0.0, t);
     }
 
     /// Zero all gradients.
@@ -396,6 +456,7 @@ impl PolicyNetV2 {
         self.ego_encoder.zero_grad();
         self.entity_encoder.zero_grad();
         self.attn.zero_grad();
+        self.attn2.zero_grad();
         self.fc1.zero_grad();
         self.fc2.zero_grad();
         self.actor_head.zero_grad();
@@ -407,6 +468,7 @@ impl PolicyNetV2 {
         self.ego_encoder.add_grads_from(&other.ego_encoder);
         self.entity_encoder.add_grads_from(&other.entity_encoder);
         self.attn.add_grads_from(&other.attn);
+        self.attn2.add_grads_from(&other.attn2);
         self.fc1.add_grads_from(&other.fc1);
         self.fc2.add_grads_from(&other.fc2);
         self.actor_head.add_grads_from(&other.actor_head);
@@ -418,6 +480,7 @@ impl PolicyNetV2 {
         self.ego_encoder.copy_weights_from(&other.ego_encoder);
         self.entity_encoder.copy_weights_from(&other.entity_encoder);
         self.attn.copy_weights_from(&other.attn);
+        self.attn2.copy_weights_from(&other.attn2);
         self.fc1.copy_weights_from(&other.fc1);
         self.fc2.copy_weights_from(&other.fc2);
         self.actor_head.copy_weights_from(&other.actor_head);
@@ -429,6 +492,7 @@ impl PolicyNetV2 {
         self.ego_encoder.init_grads();
         self.entity_encoder.init_grads();
         self.attn.init_grads();
+        self.attn2.init_grads();
         self.fc1.init_grads();
         self.fc2.init_grads();
         self.actor_head.init_grads();

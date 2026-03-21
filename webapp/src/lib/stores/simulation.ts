@@ -74,7 +74,7 @@ export const status = writable<SwarmStatus>({
     simulationTime: 0,
     droneCount: 0,
     selectedCount: 0,
-    speedMultiplier: 8.0,
+    speedMultiplier: 16.0,
     isValid: false,
 });
 
@@ -164,8 +164,8 @@ export const formationConfig = writable<FormationConfig>({
 
 // Strategy configuration per group
 export type StrategyType = 'none' | 'defend_area' | 'attack_zone' | 'patrol_perimeter' | 'doctrine_aggressive' | 'doctrine_defensive' | 'doctrine_rl';
-export const groupAStrategy = writable<StrategyType>('patrol_perimeter');
-export const groupBStrategy = writable<StrategyType>('patrol_perimeter');
+export const groupAStrategy = writable<StrategyType>('doctrine_rl');
+export const groupBStrategy = writable<StrategyType>('doctrine_defensive');
 
 // Legacy - kept for compatibility with AvoidanceSlider
 export const avoidanceLookahead = writable(1.0);
@@ -201,6 +201,8 @@ const DEFENSE_RESERVE = 0.4;
 
 /** Cached RL model JSON (fetched once, reused). */
 let rlModelJsonCache: string | null = null;
+/** Cached normalizer JSON (fetched once, reused). */
+let rlNormalizerJsonCache: string | null = null;
 
 async function loadRlModelJson(): Promise<string> {
     if (rlModelJsonCache) return rlModelJsonCache;
@@ -208,6 +210,18 @@ async function loadRlModelJson(): Promise<string> {
     if (!resp.ok) throw new Error(`Failed to load RL model: ${resp.statusText}`);
     rlModelJsonCache = await resp.text();
     return rlModelJsonCache;
+}
+
+async function loadRlNormalizerJson(): Promise<string | null> {
+    if (rlNormalizerJsonCache !== null) return rlNormalizerJsonCache;
+    try {
+        const resp = await fetch('/models/best_model_normalizers.json');
+        if (!resp.ok) return null;
+        rlNormalizerJsonCache = await resp.text();
+        return rlNormalizerJsonCache;
+    } catch {
+        return null;
+    }
 }
 
 /** Track last known target destruction count to detect changes */
@@ -949,7 +963,7 @@ function applyStrategy(group: 0 | 1, strategy: StrategyType): void {
             );
             const initialEnemyDrones = otherDrones.length;
 
-            loadRlModelJson().then(modelJson => {
+            Promise.all([loadRlModelJson(), loadRlNormalizerJson()]).then(([modelJson, normJson]) => {
                 if (!manager) return;
                 manager.loadRlModelMulti(
                     group,
@@ -959,6 +973,9 @@ function applyStrategy(group: 0 | 1, strategy: StrategyType): void {
                     friendlyTargets.length,
                     enemyTargets.length,
                 );
+                if (normJson) {
+                    manager.loadRlNormalizers(group, normJson);
+                }
             }).catch(err => {
                 console.error('Failed to load RL model:', err);
             });

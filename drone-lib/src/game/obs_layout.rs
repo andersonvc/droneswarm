@@ -2,7 +2,7 @@
 ///
 /// Observations are split into:
 /// 1. Ego features: fixed 25-dim vector for the drone's own state
-/// 2. Entity tokens: variable-length 8-dim tokens for all visible entities
+/// 2. Entity tokens: variable-length 10-dim tokens for all visible entities
 ///
 /// V1 legacy constants retained for wasm-lib backward compatibility.
 
@@ -13,11 +13,11 @@
 /// Ego feature dimensionality (25 dimensions).
 pub const EGO_DIM: usize = 25;
 
-/// Per-entity token dimensionality (8 dimensions).
-pub const ENTITY_DIM: usize = 8;
+/// Per-entity token dimensionality (10 dimensions).
+pub const ENTITY_DIM: usize = 10;
 
-/// Discrete action space size (19 actions, no Hold).
-pub const ACT_DIM: usize = 19;
+/// Discrete action space size (13 actions, no Hold).
+pub const ACT_DIM: usize = 13;
 
 /// Maximum entity tokens for batched padding.
 pub const MAX_ENTITIES: usize = 64;
@@ -55,7 +55,7 @@ pub mod ego_idx {
     pub const GLOBAL_FRIENDLIES_IN_BLAST: usize = 24;
 }
 
-/// Entity token field indices [0..8].
+/// Entity token field indices [0..10].
 pub mod entity_idx {
     pub const DX: usize = 0;
     pub const DY: usize = 1;
@@ -64,18 +64,23 @@ pub mod entity_idx {
     pub const VY: usize = 4;
     /// Relative heading: atan2(dy, dx) - my_heading, normalized to [-1, 1].
     pub const HEADING_REL: usize = 5;
-    /// Type: 0=enemy_drone, 1=friendly_drone, 2=enemy_target, 3=friendly_target.
+    /// Type: 0.0=enemy_drone, 0.33=friendly_drone, 0.67=enemy_target, 1.0=friendly_target.
     pub const TYPE_FLAG: usize = 6;
     /// 1.0 for real entities, 0.0 for padding.
     pub const ALIVE_FLAG: usize = 7;
+    /// Number of friendly drones assigned to target this entity (normalized).
+    /// Currently 0.0 (placeholder for future assignment tracking).
+    pub const ASSIGNMENT_COUNT: usize = 8;
+    /// 1.0 if this entity is the drone's current task target, 0.0 otherwise.
+    pub const IS_CURRENT_TARGET: usize = 9;
 }
 
 /// Entity type flag values for entity_idx::TYPE_FLAG.
 pub mod entity_type {
     pub const ENEMY_DRONE: f32 = 0.0;
-    pub const FRIENDLY_DRONE: f32 = 1.0;
-    pub const ENEMY_TARGET: f32 = 2.0;
-    pub const FRIENDLY_TARGET: f32 = 3.0;
+    pub const FRIENDLY_DRONE: f32 = 0.33;
+    pub const ENEMY_TARGET: f32 = 0.67;
+    pub const FRIENDLY_TARGET: f32 = 1.0;
 }
 
 // ============================================================================

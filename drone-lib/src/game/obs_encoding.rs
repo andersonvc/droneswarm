@@ -1,7 +1,7 @@
 //! Entity-based observation encoding for per-drone RL (V2).
 //!
 //! Produces structured observations: ego features (fixed 25-dim) + entity tokens
-//! (variable-length 8-dim each). Used by sim_runner for training and wasm-lib for inference.
+//! (variable-length 10-dim each). Used by sim_runner for training and wasm-lib for inference.
 
 use std::collections::HashMap;
 
@@ -35,6 +35,8 @@ pub fn encode_drone_observation(
     targets_a: &[TargetState],
     targets_b: &[TargetState],
     last_actions: &HashMap<usize, u32>,
+    attack_targets: &HashMap<usize, Position>,
+    intercept_targets: &HashMap<usize, usize>,
     tick_count: u32,
     bounds: &Bounds,
     config: &ObservationEncoderConfig,
@@ -138,6 +140,12 @@ pub fn encode_drone_observation(
     // ========================================================================
     let mut entities: Vec<[f32; ENTITY_DIM]> = Vec::new();
 
+    // Determine the drone's current target for IS_CURRENT_TARGET.
+    // attack_targets maps drone_id -> target Position (for attack tasks).
+    // intercept_targets maps drone_id -> enemy_drone_id (for intercept tasks).
+    let my_attack_target: Option<Position> = attack_targets.get(&drone.id).copied();
+    let my_intercept_target_id: Option<usize> = intercept_targets.get(&drone.id).copied();
+
     // Enemy drones
     let mut enemy_drones: Vec<(f32, &GameDrone)> = all_drones
         .iter()
@@ -149,7 +157,7 @@ pub fn encode_drone_observation(
         .collect();
     enemy_drones.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
     for (_, d) in &enemy_drones {
-        entities.push(make_drone_entity(
+        let mut token = make_drone_entity(
             d,
             my_pos,
             my_heading,
@@ -157,7 +165,19 @@ pub fn encode_drone_observation(
             diag,
             bounds,
             entity_type::ENEMY_DRONE,
-        ));
+        );
+        // Mark as current target if this drone is being intercepted.
+        if my_intercept_target_id == Some(d.id) {
+            token[entity_idx::IS_CURRENT_TARGET] = 1.0;
+        }
+        // Count how many friendly drones are assigned to intercept this enemy drone.
+        let intercept_count = intercept_targets
+            .values()
+            .filter(|&&target_id| target_id == d.id)
+            .count() as f32;
+        token[entity_idx::ASSIGNMENT_COUNT] =
+            intercept_count / config.initial_drones_per_side as f32;
+        entities.push(token);
     }
 
     // Friendly drones (excluding self)
@@ -198,7 +218,7 @@ pub fn encode_drone_observation(
         .collect();
     enemy_targets.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
     for (_, t) in &enemy_targets {
-        entities.push(make_target_entity(
+        let mut token = make_target_entity(
             t,
             my_pos,
             my_heading,
@@ -206,7 +226,24 @@ pub fn encode_drone_observation(
             diag,
             bounds,
             entity_type::ENEMY_TARGET,
-        ));
+        );
+        // Mark as current target if this is the attack target position.
+        if let Some(atk_pos) = my_attack_target {
+            let dist_to_atk = bounds.distance(t.pos.as_vec2(), atk_pos.as_vec2());
+            if dist_to_atk < 1.0 {
+                token[entity_idx::IS_CURRENT_TARGET] = 1.0;
+            }
+        }
+        // Count how many friendly drones are assigned to attack this target.
+        let attack_count = attack_targets
+            .values()
+            .filter(|atk_pos| {
+                bounds.distance(t.pos.as_vec2(), atk_pos.as_vec2()) < 50.0
+            })
+            .count() as f32;
+        token[entity_idx::ASSIGNMENT_COUNT] =
+            attack_count / config.initial_drones_per_side as f32;
+        entities.push(token);
     }
 
     // Friendly targets
@@ -246,7 +283,7 @@ pub fn encode_drone_observation(
     (ego, entities_flat, n_entities)
 }
 
-/// Create an 8-dim entity token for a drone.
+/// Create a 10-dim entity token for a drone.
 fn make_drone_entity(
     d: &GameDrone,
     my_pos: Vec2,
@@ -276,7 +313,7 @@ fn make_drone_entity(
     token
 }
 
-/// Create an 8-dim entity token for a target (no velocity/heading).
+/// Create a 10-dim entity token for a target (no velocity/heading).
 fn make_target_entity(
     t: &TargetState,
     my_pos: Vec2,
@@ -337,13 +374,10 @@ fn phase_to_ordinal(phase: &str) -> f32 {
 
 /// Normalize angle to [-PI, PI].
 fn normalize_angle(angle: f32) -> f32 {
-    let mut a = angle;
-    while a > std::f32::consts::PI {
-        a -= 2.0 * std::f32::consts::PI;
-    }
-    while a < -std::f32::consts::PI {
-        a += 2.0 * std::f32::consts::PI;
-    }
+    let two_pi = 2.0 * std::f32::consts::PI;
+    let mut a = angle % two_pi;
+    if a > std::f32::consts::PI { a -= two_pi; }
+    if a < -std::f32::consts::PI { a += two_pi; }
     a
 }
 
