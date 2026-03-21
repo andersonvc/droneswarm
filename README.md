@@ -1,5 +1,7 @@
 # DroneSwarm
 
+[**Live Demo**](https://andersonvc.github.io/droneswarm/)
+
 Multi-agent reinforcement learning for autonomous drone swarm combat, built on a DoD-aligned control hierarchy.
 
 Two swarms fight to destroy each other's targets. One side learns through RL. The other uses doctrine — rule-based force allocation modeled after real military C2. The RL agent has to figure out attack strategies, target prioritization, and team coordination from scratch.
@@ -42,17 +44,23 @@ The RL agent replaces the Doctrine + Strategy layers. Instead of rule-based forc
 
 **Architecture**: Entity-attention policy with MAPPO centralized critic and QMIX value decomposition.
 
+```mermaid
+graph TD
+    EGO["Ego Features<br/><i>25-dim</i>"] --> EGO_ENC["Ego Encoder<br/><i>25→64, ReLU</i>"]
+    ENT["Entity Tokens<br/><i>N × 10-dim</i>"] --> ENT_ENC["Entity Encoder<br/><i>10→64, ReLU</i>"]
+
+    ENT_ENC --> ATTN1["Attention Layer 1<br/><i>4 heads + residual + LayerNorm</i>"]
+    ATTN1 --> ATTN2["Attention Layer 2<br/><i>4 heads + residual + LayerNorm</i>"]
+    ATTN2 --> POOL["Max Pool<br/><i>N×64 → 64</i>"]
+
+    EGO_ENC --> CONCAT["Concat<br/><i>128-dim</i>"]
+    POOL --> CONCAT
+    CONCAT --> FC["Trunk MLP<br/><i>128→256→256</i>"]
+    FC --> ACTOR["Actor Head<br/><i>13 actions</i>"]
+    FC --> CRITIC["Centralized Critic<br/><i>+ team mean pool</i>"]
 ```
-Ego features (25-dim)  ─────────────────────────────────┐
-                                                         |
-Entity tokens (N x 10-dim)                               |
-   → Entity Encoder                                      |
-   → 2-layer Multi-Head Attention (residual + LayerNorm) |
-   → Max Pool                                            |
-   → concat ─────────────────────────────────────────────┘
-   → Trunk MLP (256-dim)
-   → Actor Head (13 actions) + Centralized Critic
-```
+
+Full architecture diagrams in [`docs/architecture.md`](docs/architecture.md).
 
 **Training setup**:
 - PPO with per-drone GAE and centralized critic baseline
@@ -131,6 +139,10 @@ droneswarm/
 cargo run --release --bin train -- --help          # Training options
 cargo test --workspace --exclude wasm-lib          # Run tests
 ```
+
+## Disclaimer
+
+This project is a research and educational tool. It does not contain controlled technology — the simulator is a simple 2D physics engine, and all autonomy and RL techniques are derived from publicly available academic literature. Drone combat serves as the problem domain because it makes multi-agent coordination tangible and easy to evaluate, but the underlying architecture is domain-agnostic. The same approach generalizes to any cooperative multi-agent setting: logistics fleets, search and rescue, environmental monitoring, warehouse robotics, etc.
 
 ## License
 
