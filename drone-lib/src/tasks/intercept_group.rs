@@ -258,7 +258,7 @@ impl DroneTask for InterceptGroupTask {
     }
 
     fn process_feedback(&mut self, _feedback: &SafetyFeedback) {
-        // Kamikaze — ignore safety feedback
+        // Terminal engagement — ignore safety feedback
     }
 
     fn phase_name(&self) -> &str {

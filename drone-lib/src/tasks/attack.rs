@@ -1,7 +1,7 @@
 //! Attack task: navigate to a fixed position and detonate.
 //!
 //! Supports two modes:
-//! - **Direct**: Full speed beeline to target, ignores safety feedback (kamikaze).
+//! - **Direct**: Full speed beeline to target, ignores safety feedback (terminal dive).
 //! - **Evasive**: Dodges threats en route by blending safety feedback into desired
 //!   velocity. Commits to direct mode when close to target (< 2x detonation radius).
 

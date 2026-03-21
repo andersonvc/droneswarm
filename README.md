@@ -34,7 +34,7 @@ PLATFORM    Vehicle kinematics and physics             sub-tick
 
 Information flows both directions: goals go down, status and feedback go up. A drone's task says "fly toward the enemy." Its safety layer says "but avoid the friendly drone in my path." The task adapts.
 
-See [`docs/control-hierarchies.md`](docs/control-hierarchies.md) for the full literature survey mapping our architecture to 3T, DARPA OFFSET, ALFUS, and subsumption.
+See [`docs/control-hierarchies.md`](docs/control-hierarchy.md) for the full literature survey mapping our architecture to 3T, DARPA OFFSET, ALFUS, and subsumption.
 
 ---
 
@@ -90,7 +90,7 @@ Update 35: win_A=58%,  mean_r=+3.60
 
 The game engine handles combat between two groups in a bounded 2D world.
 
-- **Drones** are kamikaze weapons — they fly to a target and detonate (187.5m blast radius), destroying the target and anything nearby
+- **Drones** are loitering munitions — they fly to a target and detonate (187.5m blast radius), destroying the target and anything nearby
 - **Targets** are static positions. Destroy all enemy targets to win.
 - **Doctrine AI** autonomously allocates forces between defense (patrol orbits, intercept threats) and offense (coordinated attack waves)
 - Each drone runs the full control hierarchy: task assignment → behavior tree → safety layer → platform physics

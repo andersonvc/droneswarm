@@ -167,7 +167,7 @@ impl DroneAgent {
 
         // 3. Safety layer: adjust velocity for collision avoidance.
         //    If intercepting a target, exclude that drone from the swarm
-        //    so ORCA/APF won't push us away from it (kamikaze behavior).
+        //    so ORCA/APF won't push us away from it (terminal engagement).
         let (safe_vel, feedback) = if !output.exclude_from_ca.is_empty() {
             let filtered: Vec<DroneInfo> = swarm.iter()
                 .copied()

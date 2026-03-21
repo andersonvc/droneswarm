@@ -1,4 +1,4 @@
-//! Intercept task: kamikaze pursuit of an enemy drone.
+//! Intercept task: terminal pursuit of an enemy drone.
 //!
 //! The interceptor charges straight at its target without evading.
 //! Collision avoidance is disabled for the target drone so the
@@ -121,7 +121,7 @@ impl DroneTask for InterceptTask {
             };
         }
 
-        // Always pursue — no evasion for kamikaze intercept
+        // Always pursue — no evasion for terminal intercept
         let desired_vel = self.pursue_velocity(state, target, bounds, max_speed);
 
         let heading = if desired_vel.magnitude() > f32::EPSILON {
@@ -139,7 +139,7 @@ impl DroneTask for InterceptTask {
     }
 
     fn process_feedback(&mut self, _feedback: &SafetyFeedback) {
-        // Kamikaze intercept ignores safety feedback — stay on target
+        // Terminal intercept ignores safety feedback — stay on target
     }
 
     fn phase_name(&self) -> &str {
@@ -242,7 +242,7 @@ mod tests {
             safe_velocity: Vec2::new(-60.0, 30.0),
         };
 
-        // Kamikaze intercept ignores feedback — should stay in pursue
+        // Terminal intercept ignores feedback — should stay in pursue
         task.process_feedback(&feedback);
         assert_eq!(task.phase_name(), "pursue");
     }
