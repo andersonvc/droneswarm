@@ -1,6 +1,6 @@
 //! Inference-only MLP for running trained policy networks.
 //!
-//! Deserializes the same JSON format as rl-train's PolicyNet
+//! Deserializes the same JSON format as the training pipeline's PolicyNet
 //! but includes only the forward pass — no gradients, no backprop.
 //! Designed to run in WASM with zero overhead.
 
@@ -249,7 +249,7 @@ pub struct InferenceNetV2 {
 }
 
 impl InferenceNetV2 {
-    /// Load from JSON string (same format as rl-train's PolicyNetV2::save).
+    /// Load from JSON string (same format as PolicyNetV2Torch.save_weights).
     pub fn from_json(json: &str) -> Result<Self, String> {
         serde_json::from_str(json).map_err(|e| format!("Failed to parse V2 model JSON: {}", e))
     }
@@ -346,7 +346,7 @@ impl InferenceNetV2 {
 }
 
 impl InferenceNet {
-    /// Load from JSON string (same format as rl-train's PolicyNet::save).
+    /// Load from JSON string (same format as the training pipeline's PolicyNet).
     pub fn from_json(json: &str) -> Result<Self, String> {
         serde_json::from_str(json).map_err(|e| format!("Failed to parse model JSON: {}", e))
     }

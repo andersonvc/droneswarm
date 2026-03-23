@@ -74,7 +74,7 @@ Full architecture diagrams in [`docs/architecture.md`](docs/architecture.md).
 ### Running training
 
 ```bash
-cargo run --release --bin train -- --timesteps 0 --n-envs 1024 --eval-freq 5 --eval-episodes 50
+cd rl-train && pip install -e . && python train.py
 ```
 
 Recent 4v4 run:
@@ -121,10 +121,9 @@ droneswarm/
 │   ├── behaviors/    Collision avoidance, steering (reactive layer)
 │   └── platform/     Vehicle kinematics
 │
-├── rl-train/         RL training pipeline
-│   ├── network/      Entity-attention policy, critic, QMIX, LayerNorm
-│   ├── ppo/          GAE, PPO backward pass
-│   └── main.rs       Training loop
+├── rl-train/         RL training pipeline (Rust sim bindings + PyTorch)
+│   ├── src/lib.rs    PyO3 vectorized environment wrapper
+│   └── train.py      PPO training loop, policy network, curriculum
 │
 ├── wasm-lib/         Rust → WASM bridge
 └── webapp/           SvelteKit frontend
@@ -136,7 +135,7 @@ droneswarm/
 
 ```bash
 ./dev.sh                                          # Dev server
-cargo run --release --bin train -- --help          # Training options
+cd rl-train && pip install -e . && python train.py  # Training
 cargo test --workspace --exclude wasm-lib          # Run tests
 ```
 

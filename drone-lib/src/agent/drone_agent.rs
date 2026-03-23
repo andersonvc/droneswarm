@@ -99,6 +99,12 @@ impl DroneAgent {
         }
     }
 
+    /// Skip ORCA constraint solving in the safety layer (training speedup).
+    /// APF repulsion still applies for basic separation.
+    pub fn set_skip_orca(&mut self, skip: bool) {
+        self.safety_layer.skip_orca = skip;
+    }
+
     /// Get the drone's unique identifier.
     pub fn uid(&self) -> usize {
         self.id

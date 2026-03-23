@@ -1,0 +1,8 @@
+{
+    "lr": 3e-4,
+    "ent_coef": 0.03,
+    "clip_range": 0.2,
+    "max_grad_norm": 0.5,
+    "n_epochs": 5,
+    "batch_size": 4096
+}

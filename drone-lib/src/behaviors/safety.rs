@@ -20,6 +20,8 @@ use crate::types::{Bounds, DroneInfo, State, Vec2};
 pub struct SafetyLayer {
     pub orca_config: ORCAConfig,
     pub apf_config: APFConfig,
+    /// Skip ORCA constraint solving (training speedup). APF still applies.
+    pub skip_orca: bool,
 }
 
 impl SafetyLayer {
@@ -28,6 +30,7 @@ impl SafetyLayer {
         SafetyLayer {
             orca_config,
             apf_config,
+            skip_orca: false,
         }
     }
 
@@ -42,16 +45,20 @@ impl SafetyLayer {
         swarm: &[DroneInfo],
         bounds: &Bounds,
     ) -> (Vec2, SafetyFeedback) {
-        // 1. ORCA: compute collision-free velocity
-        let orca_vel = compute_orca_velocity(
-            state.pos,
-            state.vel,
-            drone_id,
-            desired_vel,
-            swarm,
-            bounds,
-            &self.orca_config,
-        );
+        // 1. ORCA: compute collision-free velocity (skip in training mode for speed)
+        let orca_vel = if self.skip_orca {
+            desired_vel
+        } else {
+            compute_orca_velocity(
+                state.pos,
+                state.vel,
+                drone_id,
+                desired_vel,
+                swarm,
+                bounds,
+                &self.orca_config,
+            )
+        };
 
         // 2. APF: apply repulsive forces on top of ORCA result
         let apf_force = calculate_apf_from_swarm(

@@ -5,3 +5,4 @@ emsdk/
 node_modules/
 wasm-lib/pkg/
 .venv/
+__pycache__/

@@ -117,16 +117,16 @@ impl GameEngine {
             &self.bounds,
         );
 
-        // 5. Collision detection.
-        let collided = detect_collisions(
-            &self.drones,
-            self.config.collision_distance,
-            &self.bounds,
-        );
-
-        // Merge all destroyed IDs.
+        // 5. Collision detection (skip if collision_distance is zero — training optimization).
         let mut destroyed_ids = det_result.destroyed_ids;
-        destroyed_ids.extend(collided);
+        if self.config.collision_distance > 0.0 {
+            let collided = detect_collisions(
+                &self.drones,
+                self.config.collision_distance,
+                &self.bounds,
+            );
+            destroyed_ids.extend(collided);
+        }
 
         // 6. Remove destroyed drones + cleanup tracking maps.
         if !destroyed_ids.is_empty() {

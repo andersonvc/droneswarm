@@ -30,7 +30,7 @@ use crate::tasks::patrol::PatrolTask;
 use crate::tasks::TaskStatus;
 use crate::types::{Bounds, DroneInfo, Heading, Position, Vec2};
 
-// Re-export game types for backward compatibility with rl-train.
+// Re-export game types used by rl-train and other consumers.
 pub use crate::game::result::GameResult;
 pub use crate::game::state::TargetState as _TargetStateAlias;
 
@@ -54,9 +54,9 @@ const THREAT_RADIUS_MULTIPLIER: f32 = 5.0;
 
 pub use crate::game::obs_layout::{EGO_DIM, ENTITY_DIM, ACT_DIM, MAX_ENTITIES, MAX_VELOCITY, OBS_DIM, OBS_DIM_V2};
 /// How often the multi-agent RL makes decisions (in ticks).
-/// At dt=0.05 and speed_multiplier=2 (training), this is 20*0.05*2 = 2 seconds of sim time.
+/// At dt=0.05 and speed_multiplier=4 (training), this is 10*0.05*4 = 2 seconds of sim time.
 /// Faster than doctrine (DECISION_INTERVAL=60) to allow reactive per-drone control.
-const MULTI_DECISION_INTERVAL: u32 = 20;
+const MULTI_DECISION_INTERVAL: u32 = 10;
 
 // World layout fractions (derived from 10000m world proportions).
 const TARGET_A_MIN_FRAC: f32 = 0.225;
@@ -81,6 +81,8 @@ pub struct SimConfig {
     pub speed_multiplier: f32,
     /// If true, randomize Group B doctrine between Aggressive/Defensive each reset.
     pub randomize_opponent: bool,
+    /// Skip ORCA constraint solving for training speed. APF repulsion still applies.
+    pub skip_orca: bool,
 }
 
 impl Default for SimConfig {
@@ -94,6 +96,7 @@ impl Default for SimConfig {
             dt: 0.05,
             speed_multiplier: 8.0,
             randomize_opponent: false,
+            skip_orca: false,
         }
     }
 }
@@ -220,8 +223,15 @@ impl SimRunner {
         let bounds = Bounds::new(config.world_size, config.world_size).unwrap();
         let group_split_id = config.drones_per_side as usize;
 
+        let game_config = if config.skip_orca {
+            let mut gc = crate::game::config::GameConfig::default();
+            gc.collision_distance = 0.0; // Skip collision detection for training speed
+            gc
+        } else {
+            crate::game::config::GameConfig::default()
+        };
         let mut runner = SimRunner {
-            engine: GameEngine::new(bounds, group_split_id),
+            engine: GameEngine::with_config(bounds, group_split_id, game_config),
             doctrine_a: SwarmDoctrine::new(vec![], 0, vec![], vec![], vec![], DETONATION_RADIUS, DoctrineMode::Aggressive),
             doctrine_b: SwarmDoctrine::new(vec![], 1, vec![], vec![], vec![], DETONATION_RADIUS, DoctrineMode::Defensive),
             initial_drones_per_side: config.drones_per_side,
@@ -279,6 +289,7 @@ impl SimRunner {
             let mut agent = DroneAgent::new(i as usize, pos, hdg, self.engine.bounds);
             agent.set_group(0);
             self.configure_combat_safety(&mut agent);
+            if self.config.skip_orca { agent.set_skip_orca(true); }
             drones.push(GameDrone { id: i as usize, agent, group: 0 });
         }
         // Group B drones (IDs drones_per_side..2*drones_per_side).
@@ -289,6 +300,7 @@ impl SimRunner {
             let mut agent = DroneAgent::new(id, pos, hdg, self.engine.bounds);
             agent.set_group(1);
             self.configure_combat_safety(&mut agent);
+            if self.config.skip_orca { agent.set_skip_orca(true); }
             drones.push(GameDrone { id, agent, group: 1 });
         }
         self.engine.drones = drones;
