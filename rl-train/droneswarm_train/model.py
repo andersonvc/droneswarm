@@ -38,7 +38,7 @@ class EntityAttention(nn.Module):
         self.w_v = nn.Linear(embed_dim, embed_dim, bias=True)
         self.w_o = nn.Linear(embed_dim, embed_dim, bias=True)
 
-        self.layer_norm = nn.LayerNorm(embed_dim)
+        self.layer_norm = nn.LayerNorm(embed_dim, eps=1e-4)  # higher eps for MPS stability
 
     def forward(
         self, x: torch.Tensor, mask: Optional[torch.Tensor] = None
@@ -47,25 +47,27 @@ class EntityAttention(nn.Module):
         H = self.n_heads
         D = self.head_dim
 
-        q = self.w_q(x).view(B, S, H, D).transpose(1, 2)
-        k = self.w_k(x).view(B, S, H, D).transpose(1, 2)
-        v = self.w_v(x).view(B, S, H, D).transpose(1, 2)
+        # Pre-LN: normalize before attention (more stable gradients than Post-LN).
+        x_norm = self.layer_norm(x.float()).to(x.dtype)
 
-        # Manual attention (more stable on MPS than F.scaled_dot_product_attention).
-        scores = torch.matmul(q, k.transpose(-2, -1)) * (D ** -0.5)
-        scores = scores.clamp(-50.0, 50.0)  # prevent overflow before softmax
+        q = self.w_q(x_norm).view(B, S, H, D).transpose(1, 2)
+        k = self.w_k(x_norm).view(B, S, H, D).transpose(1, 2)
+        v = self.w_v(x_norm).view(B, S, H, D).transpose(1, 2)
+
+        scores = torch.matmul(q.float(), k.float().transpose(-2, -1)) * (D ** -0.5)
+        scores = scores.clamp(-20.0, 20.0)
 
         if mask is not None:
-            pad_mask = ~mask.unsqueeze(1).unsqueeze(2)  # [B, 1, 1, S] True=padding
-            scores = scores.masked_fill(pad_mask, -1e4)  # finite for MPS stability
+            pad_mask = ~mask.unsqueeze(1).unsqueeze(2)
+            scores = scores.masked_fill(pad_mask, -1e4)
 
         attn = F.softmax(scores, dim=-1)
-        attn = attn.clamp(min=1e-8)  # prevent exact zeros
-        out = torch.matmul(attn, v)
+        out = torch.matmul(attn, v.float())
 
         out = out.transpose(1, 2).contiguous().view(B, S, E)
         out = self.w_o(out)
-        out = self.layer_norm(out + x)
+        # Residual connection bypasses LayerNorm (clean gradient path).
+        out = out + x
 
         return out
 
@@ -95,6 +97,10 @@ class PolicyNetV2Torch(nn.Module):
         entities: torch.Tensor,
         n_entities: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Force float32 throughout for MPS stability.
+        ego = ego.float()
+        entities = entities.float()
+
         ego_embed = F.relu(self.ego_encoder(ego))
         entity_embed = F.relu(self.entity_encoder(entities))
 
@@ -105,8 +111,9 @@ class PolicyNetV2Torch(nn.Module):
         attn_out = self.attn(entity_embed, mask=attn_mask)
         attn_out = self.attn2(attn_out, mask=attn_mask)
 
+        # Max pool: use large negative instead of -inf to avoid NaN in MPS backward.
         fill_mask = ~attn_mask.unsqueeze(-1)
-        attn_out_masked = attn_out.masked_fill(fill_mask, float("-inf"))
+        attn_out_masked = attn_out.masked_fill(fill_mask, -1e4)
 
         pooled = attn_out_masked.max(dim=1).values
         all_padded = n_entities == 0

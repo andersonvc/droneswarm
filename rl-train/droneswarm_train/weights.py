@@ -1,6 +1,7 @@
 """Model weight I/O: load/save between PyTorch and Rust serde JSON format."""
 
 import json
+import math
 import os
 
 import numpy as np
@@ -151,11 +152,24 @@ def save_normalizers(
 ) -> None:
     """Save normalizer state alongside model checkpoint."""
     norm_path = path.replace(".json", "_normalizers.json")
+    # Include "entity" key for WASM compatibility (entity normalization is disabled
+    # but the WASM inference code still tries to parse it).
+    ego_state = ego_norm.state_dict()
+    entity_dim = 10
     data = {
-        "ego": ego_norm.state_dict(),
+        "ego": {
+            "mean": ego_state["mean"],
+            "var": ego_state["var"],
+            "skip_indices": [6, 7, 9],
+        },
+        "entity": {
+            "mean": [0.0] * entity_dim,
+            "var": [1.0] * entity_dim,
+            "skip_indices": [6, 7, 9],
+        },
         "value": {
-            "mean": value_norm.mean,
-            "var": value_norm.var,
+            "mean": 0.0 if (isinstance(value_norm.mean, float) and math.isnan(value_norm.mean)) else value_norm.mean,
+            "var": 1.0 if (isinstance(value_norm.var, float) and math.isnan(value_norm.var)) else value_norm.var,
             "count": value_norm.count,
         },
     }

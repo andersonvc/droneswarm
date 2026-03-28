@@ -49,7 +49,7 @@ class RunningMeanStd:
     def load_state_dict(self, d: dict) -> None:
         self.mean = torch.tensor(d["mean"], device=self.device)
         self.var = torch.tensor(d["var"], device=self.device)
-        self.count = d["count"]
+        self.count = d.get("count", 1.0)
 
 
 class ValueNormalizer:

@@ -16,7 +16,7 @@ use crate::game::engine::{GameEngine, TickResult};
 use crate::game::obs_encoding::{encode_drone_observation, ObservationEncoderConfig};
 use crate::game::obs_layout::obs_idx;
 use crate::game::patrol::build_patrol_route;
-use crate::game::reward::{compute_individual_rewards, DetonationEvent};
+use crate::game::reward::{compute_individual_rewards, ApproachContext, DetonationEvent};
 use crate::game::rng::lcg_f32;
 use crate::game::state::{GameDrone, TargetState};
 use crate::strategies::{StrategyDroneState, SwarmStrategy, TaskAssignment};
@@ -210,6 +210,9 @@ pub struct SimRunner {
 
     /// Track which drones had active tasks (for idle death penalty).
     per_drone_had_task: HashMap<usize, bool>,
+
+    /// Per-drone approach context for individual reward computation.
+    approach_ctx: crate::game::reward::ApproachContext,
 }
 
 impl SimRunner {
@@ -243,6 +246,7 @@ impl SimRunner {
             snap_avg_enemy_dist: 0.0,
             last_actions: HashMap::new(),
             per_drone_had_task: HashMap::new(),
+            approach_ctx: ApproachContext { prev_distances: HashMap::new() },
             rng: 0,
             config,
         };
@@ -640,12 +644,19 @@ impl SimRunner {
                     let eg = if eid < self.engine.group_split_id { 0u32 } else { 1u32 };
                     eg != group
                 });
+                // Count friendly drones killed by this blast (excluding self).
+                let friendly_kills = tick_result.destroyed_ids.iter().filter(|&&eid| {
+                    if eid == drone_id { return false; }
+                    let eg = if eid < self.engine.group_split_id { 0u32 } else { 1u32 };
+                    eg == group
+                }).count();
                 detonation_events.push(crate::game::reward::DetonationEvent {
                     drone_id,
                     group,
                     blast_pos: blast_vec,
                     hit_target,
                     hit_enemy_drone,
+                    friendly_kills,
                 });
             }
             result = tick_result.game_result;
@@ -684,10 +695,13 @@ impl SimRunner {
             .filter(|&&id| id < self.engine.group_split_id).copied().collect();
         let group_a_drones: Vec<&GameDrone> = self.engine.drones.iter()
             .filter(|d| d.group == 0).collect();
+        let enemy_targets = if 0 == 0 { &self.engine.targets_b } else { &self.engine.targets_a };
         let individual_rewards_a = crate::game::reward::compute_individual_rewards(
             &detonation_events, &dead_group_a, &group_a_drones,
-            &self.engine.drones, &self.engine.targets_a,
+            &self.engine.drones, &self.engine.targets_a, enemy_targets,
+            &self.engine.attack_targets,
             DETONATION_RADIUS * THREAT_RADIUS_MULTIPLIER, &self.engine.bounds,
+            &mut self.approach_ctx,
         );
 
         let (obs_a, drone_ids_a) = self.observe_multi_group_v2(0);
@@ -802,12 +816,18 @@ impl SimRunner {
                     let enemy_group = if eid < self.engine.group_split_id { 0u32 } else { 1u32 };
                     enemy_group != group
                 });
+                let friendly_kills = tick_result.destroyed_ids.iter().filter(|&&eid| {
+                    if eid == drone_id { return false; }
+                    let fg = if eid < self.engine.group_split_id { 0u32 } else { 1u32 };
+                    fg == group
+                }).count();
                 detonation_events.push(DetonationEvent {
                     drone_id,
                     group,
                     blast_pos: blast_vec,
                     hit_target,
                     hit_enemy_drone,
+                    friendly_kills,
                 });
             }
 
@@ -865,14 +885,18 @@ impl SimRunner {
             .collect();
         let friendly_targets = &self.engine.targets_a;
         let threat_radius = DETONATION_RADIUS * THREAT_RADIUS_MULTIPLIER;
+        let enemy_targets_b = &self.engine.targets_b;
         let individual_rewards_a = compute_individual_rewards(
             &detonation_events,
             &dead_group_a,
             &group_a_drones,
             &self.engine.drones,
             friendly_targets,
+            enemy_targets_b,
+            &self.engine.attack_targets,
             threat_radius,
             &self.engine.bounds,
+            &mut self.approach_ctx,
         );
 
         let (obs_a, drone_ids_a) = self.observe_multi_group_v2(0);

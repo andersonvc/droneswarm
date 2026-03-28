@@ -15,6 +15,12 @@ import time
 import numpy as np
 import torch
 
+try:
+    import wandb
+    HAS_WANDB = True
+except ImportError:
+    HAS_WANDB = False
+
 import droneswarm_env
 
 from droneswarm_train.constants import EGO_DIM, ACT_DIM, SPEED_MULTIPLIER
@@ -22,7 +28,7 @@ from droneswarm_train.curriculum import Curriculum, compute_max_ticks
 from droneswarm_train.evaluate import evaluate
 from droneswarm_train.model import PolicyNetV2Torch
 from droneswarm_train.normalize import RunningMeanStd, ValueNormalizer
-from droneswarm_train.ppo import compute_gae, ppo_update
+from droneswarm_train.ppo import compute_gae, ppo_update, ReplayBuffer, PrioritizedMemory
 from droneswarm_train.rollout import collect_rollout, obs_to_tensors
 from droneswarm_train.weights import (
     load_model_weights,
@@ -75,10 +81,11 @@ def main():
     parser = argparse.ArgumentParser(
         description="RL training loop for droneswarm."
     )
-    parser.add_argument("--n-envs", type=int, default=1024)
-    parser.add_argument("--n-steps", type=int, default=128)
-    parser.add_argument("--n-epochs", type=int, default=3)
-    parser.add_argument("--batch-size", type=int, default=4096)
+    parser.add_argument("--n-envs", type=int, default=0, help="Parallel envs (0=auto-scale per stage)")
+    parser.add_argument("--n-steps", type=int, default=0, help="Steps per rollout (0=auto-scale per stage)")
+    parser.add_argument("--n-epochs", type=int, default=10)
+    parser.add_argument("--batch-size", type=int, default=12288)
+    parser.add_argument("--replay-size", type=int, default=0, help="Number of past rollouts for off-policy replay (0=disabled)")
     parser.add_argument("--lr", type=float, default=5e-4)
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--lam", type=float, default=0.97)
@@ -98,6 +105,10 @@ def main():
         help="Path to model JSON to resume from",
     )
     parser.add_argument("--output-dir", default="results")
+    parser.add_argument("--start-stage", type=int, default=0, help="Starting curriculum stage (0=4v4, 1=8v8, 2=16v16, 3=24v24)")
+    parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging")
+    parser.add_argument("--wandb-project", default="droneswarm", help="W&B project name")
+    parser.add_argument("--wandb-name", default=None, help="W&B run name")
     args = parser.parse_args()
 
     # Select device.
@@ -109,7 +120,36 @@ def main():
         if args.device != "cpu":
             print(f"[warn] {args.device} not available, falling back to cpu")
         device = torch.device("cpu")
-    print(f"Device: {device}")
+        # Use all CPU cores for PyTorch operations.
+        n_cores = os.cpu_count() or 8
+        torch.set_num_threads(n_cores)
+        torch.set_num_interop_threads(n_cores)
+    print(f"Device: {device} (threads: {torch.get_num_threads()})")
+
+    # Initialize wandb.
+    if args.wandb and HAS_WANDB:
+        wandb.init(
+            project=args.wandb_project,
+            name=args.wandb_name,
+            config={
+                "n_envs": args.n_envs,
+                "n_steps": args.n_steps,
+                "n_epochs": args.n_epochs,
+                "batch_size": args.batch_size,
+                "lr": args.lr,
+                "gamma": args.gamma,
+                "lam": args.lam,
+                "clip_range": args.clip,
+                "ent_coef_start": args.ent_coef_start,
+                "ent_coef_end": args.ent_coef_end,
+                "max_grad_norm": args.max_grad_norm,
+                "device": str(device),
+                "start_stage": args.start_stage,
+                "resume": args.resume,
+            },
+        )
+    elif args.wandb and not HAS_WANDB:
+        print("[warn] --wandb requested but wandb not installed. pip install wandb")
 
     os.makedirs(args.output_dir, exist_ok=True)
     best_model_path = os.path.join(args.output_dir, "best_model.json")
@@ -118,12 +158,22 @@ def main():
     curriculum = Curriculum(
         final_drones=args.drones, final_targets=args.targets
     )
+    if args.start_stage > 0:
+        curriculum.current_stage = min(args.start_stage, len(curriculum.stages) - 1)
+        print(f"Starting at curriculum stage {curriculum.current_stage}: {curriculum.stage_label()}")
     stage = curriculum.current()
     max_ticks = compute_max_ticks(stage["world_size"])
 
+    # Auto-scale n_envs and n_steps per curriculum stage.
+    n_envs = args.n_envs if args.n_envs > 0 else curriculum.compute_n_envs()
+    n_steps = args.n_steps if args.n_steps > 0 else curriculum.compute_n_steps()
+    print(f"  Auto-scaled: n_envs={n_envs}, n_steps={n_steps} "
+          f"(stage {curriculum.current_stage}: {stage['drones']}v{stage['drones']}, "
+          f"{stage['world_size']}m world)")
+
     # Create environments.
     env = droneswarm_env.VecSimRunner(
-        n_envs=args.n_envs,
+        n_envs=n_envs,
         drones_per_side=stage["drones"],
         targets_per_side=stage["targets"],
         world_size=stage["world_size"],
@@ -140,6 +190,8 @@ def main():
     model.train()
 
     optimizer = build_optimizer(model, lr=args.lr)
+    replay_buffer = ReplayBuffer(max_size=args.replay_size)
+    priority_memory = PrioritizedMemory(max_size=50_000)
 
     # Restore optimizer state if available alongside resume checkpoint.
     if args.resume:
@@ -169,12 +221,17 @@ def main():
     best_win_rate = 0.0
     start_time = time.monotonic()
 
+    # Auto-rollback state for collapse recovery.
+    last_good_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+    last_good_optim = optimizer.state_dict()
+    last_good_update = 0
+
     print(f"Starting PPO training")
     print(f"  Ego dim: {EGO_DIM}, Entity dim: {droneswarm_env.ENTITY_DIM}, Embed dim: 64")
     print(f"  Act dim: {ACT_DIM}, Hidden: 256, Attn heads: 4")
     print(f"  Total timesteps: {args.total_timesteps}")
     print(
-        f"  Envs: {args.n_envs}, Steps/rollout: {args.n_steps}, "
+        f"  Envs: {n_envs}, Steps/rollout: {n_steps}, "
         f"Epochs: {args.n_epochs}, Batch: {args.batch_size}"
     )
     print(
@@ -230,7 +287,7 @@ def main():
         # Collect rollout.
         t0 = time.monotonic()
         rollout, obs = collect_rollout(
-            env, model, ego_norm, obs, args.n_steps, device
+            env, model, ego_norm, obs, n_steps, device
         )
         t_rollout = time.monotonic() - t0
 
@@ -285,11 +342,49 @@ def main():
             clip_range=effective_clip,
             ent_coef=current_ent,
             max_grad_norm=effective_grad_norm,
+            replay_buffer=replay_buffer,
+            priority_memory=priority_memory,
         )
         t_ppo = time.monotonic() - t0
 
         update_count += 1
-        total_steps = update_count * args.n_steps * args.n_envs
+        total_steps = update_count * n_steps * n_envs
+
+        # MPS stability: clamp weights and fix NaN every update.
+        with torch.no_grad():
+            nan_found = False
+            for param in model.parameters():
+                if param.isnan().any() or param.isinf().any():
+                    nan_found = True
+                    param.copy_(torch.where(
+                        torch.isfinite(param), param, torch.zeros_like(param)
+                    ))
+                param.clamp_(-5.0, 5.0)
+            if nan_found:
+                print("[WARN] Sanitized NaN/Inf in model weights", flush=True)
+
+        # Collapse detection and auto-rollback.
+        last_ent_val = stats["entropy"][-1] if stats["entropy"] else 2.5
+        last_clip_val = stats["clip_fraction"][-1] if stats["clip_fraction"] else 0.0
+
+        if last_ent_val > 1.5 and last_clip_val < 0.2:
+            # Policy is healthy — save as "last good" checkpoint.
+            last_good_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            last_good_optim = optimizer.state_dict()
+            last_good_update = update_count
+
+        if last_ent_val < 0.8 or last_clip_val > 0.8:
+            # Policy collapsed — rollback to last good checkpoint.
+            if last_good_state is not None:
+                print(
+                    f"[ROLLBACK] Collapse detected (entropy={last_ent_val:.3f}, "
+                    f"clip={last_clip_val:.3f}). Restoring update {last_good_update}.",
+                    flush=True,
+                )
+                model.load_state_dict({k: v.to(device) for k, v in last_good_state.items()})
+                optimizer.load_state_dict(last_good_optim)
+                for pg in optimizer.param_groups:
+                    pg["lr"] = current_lr
 
         # Log progress.
         if update_count % 5 == 0:
@@ -310,6 +405,22 @@ def main():
                 f"{elapsed:.0f}s, {curriculum.stage_label()}"
             )
 
+            if args.wandb and HAS_WANDB:
+                wandb.log({
+                    "train/mean_reward": mean_r,
+                    "train/policy_loss": last_ploss,
+                    "train/entropy": last_ent,
+                    "train/clip_fraction": last_clip,
+                    "train/lr": current_lr,
+                    "train/ent_coef": current_ent,
+                    "train/fps": fps,
+                    "train/transitions": n_transitions,
+                    "train/rollout_time": t_rollout,
+                    "train/ppo_time": t_ppo,
+                    "train/total_steps": total_steps,
+                    "curriculum/stage": curriculum.current_stage,
+                }, step=update_count)
+
         # Evaluate.
         if update_count % args.eval_freq == 0:
             t0 = time.monotonic()
@@ -328,27 +439,41 @@ def main():
                 f"time={t_eval:.1f}s"
             )
 
+            if args.wandb and HAS_WANDB:
+                wandb.log({
+                    "eval/win_rate": win_rate,
+                    "eval/mean_reward": mean_reward,
+                    "eval/time": t_eval,
+                    "curriculum/stage": curriculum.current_stage,
+                }, step=update_count)
+
             # Win-rate-based curriculum.
             stage_change = curriculum.report_eval(win_rate)
             if stage_change == "advanced":
+                # Recompute n_envs and n_steps for new stage.
+                n_envs = args.n_envs if args.n_envs > 0 else curriculum.compute_n_envs()
+                n_steps = args.n_steps if args.n_steps > 0 else curriculum.compute_n_steps()
+                new_stage = curriculum.current()
+                new_max_ticks = compute_max_ticks(new_stage["world_size"])
                 print(
                     f"  >>> Curriculum advanced to "
                     f"{curriculum.stage_label()} "
                     f"(win_rate={win_rate*100:.1f}% exceeded "
                     f"{curriculum.advance_threshold*100:.0f}% threshold)"
                 )
-                _reconfigure_envs(env, curriculum.current(), args.n_envs)
-                obs = env.reset()
-                best_win_rate = 0.0
-
-            elif stage_change == "demoted":
                 print(
-                    f"  <<< Curriculum demoted to "
-                    f"{curriculum.stage_label()} "
-                    f"(win_rate={win_rate*100:.1f}% below "
-                    f"{curriculum.demotion_threshold*100:.0f}% threshold)"
+                    f"  Auto-scaled: n_envs={n_envs}, n_steps={n_steps}"
                 )
-                _reconfigure_envs(env, curriculum.current(), args.n_envs)
+                # Recreate environment with new scale.
+                env = droneswarm_env.VecSimRunner(
+                    n_envs=n_envs,
+                    drones_per_side=new_stage["drones"],
+                    targets_per_side=new_stage["targets"],
+                    world_size=new_stage["world_size"],
+                    max_ticks=new_max_ticks,
+                    speed_multiplier=SPEED_MULTIPLIER,
+                    skip_orca=True,
+                )
                 obs = env.reset()
                 best_win_rate = 0.0
 
@@ -388,6 +513,9 @@ def main():
         f"\nTraining complete. Steps: {total_steps}, "
         f"Best win: {best_win_rate*100:.1f}%"
     )
+
+    if args.wandb and HAS_WANDB:
+        wandb.finish()
 
 
 if __name__ == "__main__":
